@@ -4,6 +4,8 @@ A modern GPU-accelerated desktop application that captures camera input, process
 
 Built with **Python + wgpu**, designed for high performance on both AMD and Nvidia GPUs.
 
+* https://github.com/pygfx/wgpu-py?tab=readme-ov-file
+
 ---
 
 ## Features
@@ -76,20 +78,6 @@ source .venv/bin/activate  # macOS / Linux
 ```bash
 pip install -r requirements.txt
 ```
-
-Example `requirements.txt`:
-
-```
-wgpu
-opencv-python
-mediapipe
-glfw
-numpy
-pyglm
-pygltflib
-```
-
----
 
 ## Running the Application
 

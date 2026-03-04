@@ -1,0 +1,40 @@
+# Camera Mayham – Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# GPU Rendering (WebGPU via wgpu)
+# ---------------------------------------------------------------------------
+wgpu                    # WebGPU implementation for cross-vendor GPU rendering
+glfw                    # Native window & input (provides wgpu's surface handle)
+
+# ---------------------------------------------------------------------------
+# Camera Capture
+# ---------------------------------------------------------------------------
+opencv-python           # Webcam frame capture (EXT-001)
+
+# ---------------------------------------------------------------------------
+# Face Tracking  (INF-002)
+# ---------------------------------------------------------------------------
+mediapipe               # Landmark detection, head-pose, and blendshape extraction
+
+# ---------------------------------------------------------------------------
+# Numerical Computing & Data Buffers
+# ---------------------------------------------------------------------------
+numpy                   # Frame buffer arrays, GPU data preparation
+
+# ---------------------------------------------------------------------------
+# 3D Math & Model Loading  (REQ-007)
+# ---------------------------------------------------------------------------
+pyrr                    # Vectors, matrices, quaternions for 3D overlay transforms
+trimesh                 # 3D mesh loading (OBJ, glTF, STL) for face-attached models
+
+# ---------------------------------------------------------------------------
+# Widget Panel UI
+# ---------------------------------------------------------------------------
+dearpygui               # GPU-accelerated immediate-mode widget panel (REQ-010)
+
+# ---------------------------------------------------------------------------
+# Testing
+# ---------------------------------------------------------------------------
+pytest                  # Unit and integration test framework (spec §6)
+Pillow                  # Screenshot comparison for visual regression tests (spec §6)
