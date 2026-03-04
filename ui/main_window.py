@@ -577,10 +577,20 @@ class MainWindow:
     def _build_group_separator(self) -> None:
         """
         Add a thin vertical separator bar between widget item groups.
+
+        Uses a drawlist to render a vertical line rather than
+        ``dpg.add_separator()``, which always expands horizontally and
+        would break the widget bar's horizontal flow.
         """
-        with dpg.group(width=SEPARATOR_W):
+        with dpg.group(width=SEPARATOR_W + 8):
             dpg.add_spacer(height=8)
-            dpg.add_separator()
+            with dpg.drawlist(width=SEPARATOR_W + 8, height=BAR_HEIGHT - 16):
+                dpg.draw_line(
+                    (SEPARATOR_W + 4, 0),
+                    (SEPARATOR_W + 4, BAR_HEIGHT - 16),
+                    color=(80, 80, 90, 200),
+                    thickness=1,
+                )
 
     def _build_expansion_tray(self) -> None:
         """
