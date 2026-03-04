@@ -299,6 +299,13 @@ class RenderPipeline:
             self._filter_pass.textures[1],
         )
 
+        # Inject face tracking data into face-aware filters (e.g.
+        # FaceLandmarkFilter) before the filter chain records commands.
+        # Duck-typing is used so BaseFilter's interface remains unchanged.
+        for flt in state.enabled_filters():
+            if hasattr(flt, "update_face_result"):
+                flt.update_face_result(state.face_result)
+
         # Pass 2: filter chain — ping-pong tex[1] → filtered texture
         filtered_tex = self._filter_pass.record(
             encoder,

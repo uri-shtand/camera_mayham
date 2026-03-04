@@ -976,6 +976,7 @@ def _filter_icon(filter_name: str) -> str:
         "Grayscale": "B/W",
         "EdgeDetection": "EDG",
         "ColourShift": "CLR",
+        "Face Landmarks": "FACE",
     }
     return _icons.get(filter_name, filter_name[:3].upper())
 
@@ -1019,5 +1020,6 @@ def _param_max(param_key: str) -> float:
         "saturation": 4.0,
         "vignette_strength": 1.0,
         "vignette_radius": 1.0,
+        "dot_radius": 20.0,
     }
     return _maxes.get(param_key, 1.0)

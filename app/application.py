@@ -38,6 +38,7 @@ from app.state import AppState
 from camera.capture import CameraCapture
 from filters.colour_shift import ColourShiftFilter
 from filters.edge_detection import EdgeDetectionFilter
+from filters.face_landmarks import FaceLandmarkFilter
 from filters.grayscale import GrayscaleFilter
 from games.bubble_pop import BubblePopGame
 from rendering.pipeline import RenderPipeline
@@ -145,6 +146,7 @@ class Application:
             GrayscaleFilter(),
             EdgeDetectionFilter(),
             ColourShiftFilter(),
+            FaceLandmarkFilter(),
         ]:
             flt.enabled = False
             self._state.register_filter(flt)
