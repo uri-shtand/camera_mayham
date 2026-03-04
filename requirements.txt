@@ -5,7 +5,8 @@
 # GPU Rendering (WebGPU via wgpu)
 # ---------------------------------------------------------------------------
 wgpu                    # WebGPU implementation for cross-vendor GPU rendering
-glfw                    # Native window & input (provides wgpu's surface handle)
+rendercanvas            # Canvas abstraction used by wgpu (canvas-mode support)
+glfw                    # Native window backend; required by rendercanvas (transitive)
 
 # ---------------------------------------------------------------------------
 # Camera Capture
@@ -29,9 +30,9 @@ pyrr                    # Vectors, matrices, quaternions for 3D overlay transfor
 trimesh                 # 3D mesh loading (OBJ, glTF, STL) for face-attached models
 
 # ---------------------------------------------------------------------------
-# Widget Panel UI
+# Main Window UI  (spec-design-main-screen)
 # ---------------------------------------------------------------------------
-dearpygui               # GPU-accelerated immediate-mode widget panel (REQ-010)
+dearpygui               # Single-window host: camera area + widget bar (REQ-010)
 
 # ---------------------------------------------------------------------------
 # Testing

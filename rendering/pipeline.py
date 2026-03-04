@@ -28,6 +28,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
+import numpy as np
 import wgpu
 from rendercanvas import BaseRenderCanvas
 
@@ -42,40 +43,65 @@ from rendering.passes.post_pass import PostPass
 
 logger = logging.getLogger(__name__)
 
+# Bytes-per-row in GPU texture copies must be a multiple of this value.
+_COPY_BYTES_PER_ROW_ALIGN: int = 256
+
 
 class RenderPipeline:
     """
     Manages the wgpu device and orchestrates all render passes
     (§4.1, CON-001 – CON-003).
 
+    Two operating modes are supported:
+
+    **canvas mode** (``canvas`` provided)
+        The pipeline renders to the swap-chain surface of the supplied
+        ``BaseRenderCanvas`` window and presents each frame on screen.
+
+    **offscreen mode** (``canvas=None``)
+        The pipeline renders into an intermediate ``rgba8unorm`` texture.
+        After each frame the pixels are copied to CPU memory and stored in
+        :py:attr:`latest_pixels` as an ``(H, W, 4)`` uint8 NumPy array.  The
+        caller reads ``latest_pixels`` each iteration to obtain the composited
+        frame for display in any host UI (e.g. a single DPG window).
+
     Usage::
 
-        pipeline = RenderPipeline(canvas)
+        # Offscreen (single-window DPG) mode:
+        pipeline = RenderPipeline(canvas=None)
         pipeline.setup(state)
 
-        # main loop:
         while state.running:
-            pipeline.render_frame(state)
+            pixels = pipeline.render_frame(state)
+            # pixels is an (H, W, 4) uint8 ndarray (RGBA)
 
         pipeline.teardown(state)
 
     Parameters:
-        canvas: A ``BaseRenderCanvas`` instance (from ``rendercanvas``)
-                that provides the native surface for swap-chain presentation.
+        canvas: A ``BaseRenderCanvas`` instance that provides the native
+                surface for swap-chain presentation, or ``None`` for
+                offscreen rendering.
     """
 
-    def __init__(self, canvas: BaseRenderCanvas) -> None:
+    def __init__(self, canvas: Optional[BaseRenderCanvas] = None) -> None:
         """
         Store the canvas reference (does not touch the GPU yet).
 
         Parameters:
-            canvas: The rendercanvas canvas/window that owns the swap chain.
+            canvas: The rendercanvas canvas/window that owns the swap chain,
+                    or ``None`` to run in offscreen mode.
         """
         self._canvas = canvas
         self._device: Optional[wgpu.GPUDevice] = None
         self._adapter: Optional[wgpu.GPUAdapter] = None
         self._context: Optional[wgpu.GPUCanvasContext] = None
         self._surface_format: Optional[wgpu.TextureFormat] = None
+        # Offscreen output
+        self._output_texture: Optional[wgpu.GPUTexture] = None
+        self._output_bytes_per_row: int = 0
+        self.latest_pixels: Optional[np.ndarray] = None
+        """Latest rendered frame as an (H, W, 4) uint8 RGBA array (offscreen
+        mode only).  Updated after each :py:meth:`render_frame` call."""
 
         # Intermediate pipeline texture format — all passes except the
         # final blit use this format (rgba8unorm is universally supported
@@ -112,11 +138,13 @@ class RenderPipeline:
         Raises:
             RuntimeError: If no compatible GPU adapter is found.
         """
-        # Request a high-performance adapter (AMD / Nvidia preferred)
-        self._adapter = wgpu.gpu.request_adapter_sync(
-            canvas=self._canvas,
-            power_preference="high-performance",
-        )
+        # Request a high-performance adapter (AMD / Nvidia preferred).
+        # canvas is optional: pass it only in canvas mode so wgpu can
+        # match the adapter to the display surface.
+        adapter_kwargs: dict = {"power_preference": "high-performance"}
+        if self._canvas is not None:
+            adapter_kwargs["canvas"] = self._canvas
+        self._adapter = wgpu.gpu.request_adapter_sync(**adapter_kwargs)
         if self._adapter is None:  # pragma: no cover
             raise RuntimeError(
                 "No compatible WebGPU adapter found.  "
@@ -131,18 +159,44 @@ class RenderPipeline:
 
         self._device = self._adapter.request_device_sync()
 
-        # Configure the canvas surface / swap chain
-        self._context = self._canvas.get_context("wgpu")
-        self._surface_format = self._context.get_preferred_format(
-            self._adapter
-        )
-        self._context.configure(
-            device=self._device,
-            format=self._surface_format,
-            usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
-        )
-
         w, h = state.camera_width, state.camera_height
+
+        if self._canvas is not None:
+            # Canvas mode: configure the swap-chain surface.
+            self._context = self._canvas.get_context("wgpu")
+            self._surface_format = self._context.get_preferred_format(
+                self._adapter
+            )
+            self._context.configure(
+                device=self._device,
+                format=self._surface_format,
+                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+            )
+            output_format = self._surface_format
+        else:
+            # Offscreen mode: create an RGBA output texture for readback.
+            output_format = wgpu.TextureFormat.rgba8unorm
+            self._output_texture = self._device.create_texture(
+                size=(w, h, 1),
+                format=output_format,
+                usage=(
+                    wgpu.TextureUsage.RENDER_ATTACHMENT
+                    | wgpu.TextureUsage.COPY_SRC
+                ),
+            )
+            # Align bytes_per_row to GPU copy requirement (256-byte boundary)
+            unaligned = w * 4
+            remainder = unaligned % _COPY_BYTES_PER_ROW_ALIGN
+            self._output_bytes_per_row = (
+                unaligned
+                if remainder == 0
+                else unaligned + (_COPY_BYTES_PER_ROW_ALIGN - remainder)
+            )
+            logger.info(
+                "RenderPipeline offscreen mode — %dx%d, "
+                "bytes_per_row=%d",
+                w, h, self._output_bytes_per_row,
+            )
 
         # Set up each render pass
         self._bg_pass.setup(
@@ -159,13 +213,13 @@ class RenderPipeline:
             self._device, w, h, self._pipeline_format,
             state.active_game,
         )
-        self._post_pass.setup(self._device, self._surface_format)
+        self._post_pass.setup(self._device, output_format)
 
         self._last_frame_time = time.perf_counter()
         self._is_ready = True
         logger.info(
-            "RenderPipeline ready — %dx%d, surface=%s",
-            w, h, self._surface_format,
+            "RenderPipeline ready — %dx%d, output=%s",
+            w, h, output_format,
         )
 
     def teardown(self, state: AppState) -> None:
@@ -181,6 +235,7 @@ class RenderPipeline:
         self._overlay_pass.teardown(state.active_overlay)
         self._filter_pass.teardown(state.filters)
         self._bg_pass.teardown()
+        self._output_texture = None
         self._context = None
         self._device = None
         self._adapter = None
@@ -208,9 +263,15 @@ class RenderPipeline:
             state (AppState): Shared application state providing the
                 camera frame, face result, active filters, overlay,
                 and game.
+
+        Returns:
+            Optional[np.ndarray]: In offscreen mode, returns the rendered
+                frame as an ``(H, W, 4)`` uint8 RGBA array (also stored in
+                :py:attr:`latest_pixels`).  In canvas mode, returns ``None``
+                (the frame is displayed directly on the swap-chain surface).
         """
         if not self._is_ready:
-            return
+            return None
 
         now = time.perf_counter()
         dt = now - self._last_frame_time
@@ -220,9 +281,14 @@ class RenderPipeline:
         if state.camera_frame is not None:
             self._bg_pass.upload_frame(state.camera_frame)
 
-        # -- Acquire swap chain texture ------------------------------
-        surface_texture = self._context.get_current_texture()
-        surface_view = surface_texture.create_view()
+        # -- Determine output surface view ---------------------------
+        if self._canvas is not None:
+            # Canvas mode: acquire the swap-chain texture.
+            surface_texture = self._context.get_current_texture()
+            output_view = surface_texture.create_view()
+        else:
+            # Offscreen mode: render into the pre-allocated output texture.
+            output_view = self._output_texture.create_view()
 
         # -- Build command encoder -----------------------------------
         encoder = self._device.create_command_encoder()
@@ -257,14 +323,80 @@ class RenderPipeline:
             dt,
         )
 
-        # Pass 5: post-processing — blit to swap chain
-        self._post_pass.record(encoder, filtered_tex, surface_view)
+        # Pass 5: post-processing — blit to output surface/texture
+        self._post_pass.record(encoder, filtered_tex, output_view)
 
-        # -- Submit and present --------------------------------------
+        # -- Submit --------------------------------------------------
         self._device.queue.submit([encoder.finish()])
-        self._context._rc_present(force_sync=True)
+
+        # -- Present or read back pixels -----------------------------
+        if self._canvas is not None:
+            self._context._rc_present(force_sync=True)
+            pixels: Optional[np.ndarray] = None
+        else:
+            pixels = self._readback_pixels(state)
+            self.latest_pixels = pixels
 
         # -- Update diagnostics -------------------------------------
         frame_ms = (time.perf_counter() - now) * 1000.0
         state.last_frame_time_ms = frame_ms
         state.frame_count += 1
+        return pixels
+
+    # ------------------------------------------------------------------
+    # Offscreen helpers
+    # ------------------------------------------------------------------
+
+    def _readback_pixels(
+        self, state: "AppState"
+    ) -> Optional[np.ndarray]:
+        """
+        Copy the output texture to CPU memory after a submitted frame.
+
+        The copy uses ``queue.read_texture`` which is synchronous (it
+        waits for GPU work to complete).  The result is an
+        ``(H, W, 4)`` uint8 RGBA array.
+
+        Parameters:
+            state (AppState): Provides width/height dimensions.
+
+        Returns:
+            Optional[np.ndarray]: Pixel data, or ``None`` if not in
+                offscreen mode.
+        """
+        if self._output_texture is None or self._device is None:
+            return None
+
+        w = state.camera_width
+        h = state.camera_height
+        bpr = self._output_bytes_per_row  # aligned bytes per row
+
+        raw: memoryview = self._device.queue.read_texture(
+            {
+                "texture": self._output_texture,
+                "mip_level": 0,
+                "origin": (0, 0, 0),
+            },
+            {
+                "offset": 0,
+                "bytes_per_row": bpr,
+                "rows_per_image": h,
+            },
+            (w, h, 1),
+        )
+
+        # The readback buffer may have row padding; strip it if necessary.
+        if bpr == w * 4:
+            # No padding — reshape directly.
+            frame = (
+                np.frombuffer(raw, dtype=np.uint8)
+                .reshape(h, w, 4)
+                .copy()
+            )
+        else:
+            # Padded rows: copy only the valid bytes of each row.
+            buf = np.frombuffer(raw, dtype=np.uint8).reshape(h, bpr)
+            frame = np.ascontiguousarray(buf[:, : w * 4]).reshape(
+                h, w, 4
+            )
+        return frame

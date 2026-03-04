@@ -5,31 +5,34 @@ The Application class owns and coordinates all top-level subsystems:
 
 * Camera (OpenCV VideoCapture)
 * Face tracker (MediaPipe)
-* Rendering pipeline (wgpu)
-* Widget panel (Dear PyGui)
+* Rendering pipeline (wgpu — offscreen mode, no separate canvas window)
+* Main window (single Dear PyGui viewport: camera area + widget bar)
 
 It drives the main loop and is the single point of startup/shutdown for
 the entire application (GUD-001, GUD-004).
 
-Main loop
----------
+Single-window architecture (spec-design-main-screen §4.1)
+----------------------------------------------------------
 
-::
+The GPU pipeline renders into an offscreen ``rgba8unorm`` texture; after
+each frame the pixels are read back to CPU via ``queue.read_texture`` and
+forwarded to the :py:class:`ui.main_window.MainWindow` for display.  This
+keeps all UI elements — camera feed, widget bar, expansion trays — inside
+one operating-system window.
+
+Main loop::
 
     while running:
-        frame = camera.read()
+        frame   = camera.read()
         state.camera_frame = frame
         state.face_result  = tracker.process(frame)
-        pipeline.render_frame(state)     # GPU work
-        panel.render_frame()             # UI tick
+        pixels  = pipeline.render_frame(state)   # GPU work + pixel readback
+        window.render_frame(pixels)              # DPG tick + display
 """
 
 from __future__ import annotations
 
 import logging
-import sys
-
-from rendercanvas.glfw import GlfwRenderCanvas
 
 from app.state import AppState
 from camera.capture import CameraCapture
@@ -39,7 +42,7 @@ from filters.grayscale import GrayscaleFilter
 from games.bubble_pop import BubblePopGame
 from rendering.pipeline import RenderPipeline
 from tracking.face_tracker import FaceTracker
-from ui.widget_panel import WidgetPanel
+from ui.main_window import GameConfig, MainWindow, WidgetItem
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,11 @@ class Application:
     """
     Top-level application class that owns all subsystems and drives the
     main loop (GUD-001, GUD-004).
+
+    A single :py:class:`ui.main_window.MainWindow` Dear PyGui viewport
+    serves as the sole OS window; the GPU pipeline runs in offscreen mode
+    and forwards rendered pixel arrays to the window each frame
+    (spec-design-main-screen §4.1).
 
     Usage::
 
@@ -74,19 +82,20 @@ class Application:
             width (int): Render resolution width.
             height (int): Render resolution height.
         """
-        # Shared state — mutated from the UI callbacks and render loop
+        # Shared state — mutated from UI callbacks and read by the
+        # render loop.
         self._state = AppState(camera_width=width, camera_height=height)
 
-        # Subsystems (configured in setup)
+        # Subsystems (configured in _setup)
         self._camera = CameraCapture(
             device_id=camera_device_id,
             width=width,
             height=height,
         )
         self._tracker = FaceTracker(num_faces=1)
-        self._canvas: GlfwRenderCanvas | None = None
+        # Offscreen pipeline — canvas=None (single-window mode)
         self._pipeline: RenderPipeline | None = None
-        self._panel: WidgetPanel | None = None
+        self._window: MainWindow | None = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -115,7 +124,8 @@ class Application:
     def _setup(self) -> None:
         """
         Open the camera, initialise face tracking, register built-in
-        filters, create the wgpu canvas, and set up the widget panel.
+        filters, build the GPU pipeline in offscreen mode, and set up
+        the single main window.
 
         Raises:
             RuntimeError: If the camera cannot be opened.
@@ -127,34 +137,44 @@ class Application:
         self._state.camera_width = self._camera.width
         self._state.camera_height = self._camera.height
 
-        # -- Face tracker --------------------------------------------
+        # -- Face tracker ---------------------------------------------
         self._tracker.setup()
 
-        # -- Built-in filters (REQ-002) --------------------------------
+        # -- Built-in filters (REQ-002); all off by default -----------
         for flt in [
             GrayscaleFilter(),
             EdgeDetectionFilter(),
             ColourShiftFilter(),
         ]:
-            flt.enabled = False           # all off by default
+            flt.enabled = False
             self._state.register_filter(flt)
 
-        # -- wgpu canvas (GLFW native window) -------------------------
-        self._canvas = GlfwRenderCanvas(
-            title="Camera Mayham",
-            size=(self._state.camera_width, self._state.camera_height),
-        )
-
-        # -- Rendering pipeline ---------------------------------------
-        self._pipeline = RenderPipeline(self._canvas)
+        # -- GPU pipeline (offscreen — no canvas window) --------------
+        self._pipeline = RenderPipeline(canvas=None)
         self._pipeline.setup(self._state)
 
-        # -- Widget panel (Dear PyGui in a separate OS window) --------
-        self._panel = WidgetPanel(
+        # -- Game configurations for the widget bar -------------------
+        game_configs = [
+            GameConfig(
+                item=WidgetItem(
+                    id="game_bubblepop",
+                    label="BubblePop",
+                    icon="●",
+                    category="game",
+                    is_expandable=True,
+                ),
+                factory=BubblePopGame,
+            ),
+        ]
+
+        # -- Single main window (camera area + widget bar) ------------
+        self._window = MainWindow(
             state=self._state,
-            game_factory=BubblePopGame,
+            camera_width=self._state.camera_width,
+            camera_height=self._state.camera_height,
+            game_configs=game_configs,
         )
-        self._panel.setup()
+        self._window.setup()
 
         logger.info("Setup complete.")
 
@@ -168,22 +188,18 @@ class Application:
         or ``state.running`` is set to False.
 
         Each iteration:
-        1. Poll GLFW events (handles window close).
+
+        1. Check whether the main window is still open.
         2. Capture a camera frame.
         3. Run face tracking.
-        4. Render the GPU frame.
-        5. Tick the widget panel.
+        4. Render the GPU frame (offscreen); receive pixel array.
+        5. Forward pixels to the main window for display.
         """
         logger.info("Entering main loop.")
 
         while self._state.running:
-            # Check if the render window was closed
-            if self._canvas.is_closed():
-                self._state.running = False
-                break
-
-            # Check if the control panel was closed
-            if not self._panel.is_running():
+            # Check if the main window was closed
+            if not self._window.is_running():
                 self._state.running = False
                 break
 
@@ -195,11 +211,11 @@ class Application:
                 # -- Face tracking -----------------------------------
                 self._state.face_result = self._tracker.process(frame)
 
-            # -- GPU frame -------------------------------------------
-            self._pipeline.render_frame(self._state)
+            # -- GPU frame (offscreen) → pixel array -----------------
+            pixels = self._pipeline.render_frame(self._state)
 
-            # -- UI tick ---------------------------------------------
-            self._panel.render_frame()
+            # -- Main window tick + camera display -------------------
+            self._window.render_frame(pixels)
 
     # ------------------------------------------------------------------
     # Teardown
@@ -213,8 +229,8 @@ class Application:
         """
         logger.info("Shutting down…")
 
-        if self._panel is not None:
-            self._panel.teardown()
+        if self._window is not None:
+            self._window.teardown()
 
         if self._pipeline is not None:
             self._pipeline.teardown(self._state)

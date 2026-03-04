@@ -252,3 +252,110 @@ class TestAppState:
         """
         self.state.stop_game()  # should not raise
         assert self.state.active_game is None
+
+    # -- Single-select filter activation (spec-design-main-screen §4.5) --
+
+    def test_active_filter_name_defaults_to_none(self):
+        """
+        Test that no filter is active on a fresh AppState.
+
+        Expected: active_filter_name is None.
+        """
+        assert self.state.active_filter_name is None
+
+    def test_activate_filter_sets_active_name(self):
+        """
+        Test that activate_filter records the active filter name.
+
+        Expected: active_filter_name equals the activated filter's name.
+        """
+        flt = _StubFilter("Grayscale", enabled=False)
+        self.state.register_filter(flt)
+        self.state.activate_filter("Grayscale")
+        assert self.state.active_filter_name == "Grayscale"
+
+    def test_activate_filter_enables_target(self):
+        """
+        Test that activate_filter enables the named filter.
+
+        Expected: the activated filter has enabled == True.
+        """
+        flt = _StubFilter("Grayscale", enabled=False)
+        self.state.register_filter(flt)
+        self.state.activate_filter("Grayscale")
+        assert flt.enabled is True
+
+    def test_activate_filter_disables_others(self):
+        """
+        Test single-select: activating one filter disables all others.
+
+        Expected: only the activated filter is enabled; the rest are not.
+        """
+        a = _StubFilter("A", enabled=True)
+        b = _StubFilter("B", enabled=False)
+        c = _StubFilter("C", enabled=True)
+        for f in (a, b, c):
+            self.state.register_filter(f)
+        self.state.activate_filter("B")
+        assert a.enabled is False
+        assert b.enabled is True
+        assert c.enabled is False
+
+    def test_activate_filter_raises_for_unknown(self):
+        """
+        Test that activate_filter raises KeyError for an unregistered name.
+
+        Expected: KeyError is raised.
+        """
+        with pytest.raises(KeyError):
+            self.state.activate_filter("NonExistent")
+
+    def test_deactivate_filter_clears_active_name(self):
+        """
+        Test that deactivate_filter sets active_filter_name to None.
+
+        Expected: active_filter_name is None after deactivation.
+        """
+        flt = _StubFilter("Grayscale")
+        self.state.register_filter(flt)
+        self.state.activate_filter("Grayscale")
+        self.state.deactivate_filter()
+        assert self.state.active_filter_name is None
+
+    def test_deactivate_filter_disables_all_filters(self):
+        """
+        Test that deactivate_filter disables all registered filters.
+
+        Expected: every filter has enabled == False after deactivation.
+        """
+        a = _StubFilter("A", enabled=True)
+        b = _StubFilter("B", enabled=True)
+        for f in (a, b):
+            self.state.register_filter(f)
+        self.state.deactivate_filter()
+        assert all(not f.enabled for f in self.state.filters)
+
+    def test_deactivate_filter_is_noop_when_no_active(self):
+        """
+        Test that deactivate_filter is safe when no filter is active.
+
+        Expected: no exception raised; active_filter_name remains None.
+        """
+        self.state.deactivate_filter()  # should not raise
+        assert self.state.active_filter_name is None
+
+    def test_activate_replaces_previous_active_filter(self):
+        """
+        Test single-select: activating a second filter updates the name.
+
+        Expected: active_filter_name is the second filter after switching.
+        """
+        a = _StubFilter("A")
+        b = _StubFilter("B")
+        for f in (a, b):
+            self.state.register_filter(f)
+        self.state.activate_filter("A")
+        self.state.activate_filter("B")
+        assert self.state.active_filter_name == "B"
+        assert a.enabled is False
+        assert b.enabled is True

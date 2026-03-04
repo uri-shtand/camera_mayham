@@ -220,8 +220,9 @@ The following dedicated specification documents define detailed behaviour for su
 
 | Document | Scope |
 |----------|-------|
+| `spec-design-main-screen.md` | Single-window layout, widget bar, expansion tray, and active-state model |
 | `spec-design-filter-system.md` | Filter architecture, shader interface, compositing |
 | `spec-architecture-rendering-pipeline.md` | GPU pipeline technical design |
 | `spec-design-particle-engine.md` | Particle system design |
 | `spec-design-minigame-framework.md` | Mini-game framework and input model |
-| `spec-design-ui-architecture.md` | Widget panel and UI architecture |
+| `spec-design-ui-architecture.md` | Widget bar implementation architecture |

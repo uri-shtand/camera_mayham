@@ -70,6 +70,12 @@ class AppState:
     """Currently active 3D overlay model, or None for no overlay."""
 
     # ------------------------------------------------------------------
+    # Active filter — single-select tracking (spec-design-main-screen §4.5)
+    # ------------------------------------------------------------------
+    active_filter_name: Optional[str] = None
+    """Name of the currently active filter, or None when none is active."""
+
+    # ------------------------------------------------------------------
     # Mini-game — single active game instance at a time (REQ-008)
     # ------------------------------------------------------------------
     active_game: Optional[BaseGame] = None
@@ -83,6 +89,40 @@ class AppState:
 
     frame_count: int = 0
     """Total number of frames rendered since application start."""
+
+    def activate_filter(self, name: str) -> None:
+        """
+        Enable exactly one filter by name, disabling all others.
+
+        Implements single-select semantics: activating a new filter
+        automatically deactivates the previously active one
+        (spec-design-main-screen REQ-020, §4.5).
+
+        Parameters:
+            name (str): The unique name of the filter to activate.
+
+        Raises:
+            KeyError: If no filter with the given name is registered.
+        """
+        target = self.get_filter(name)
+        if target is None:
+            raise KeyError(
+                f"Filter '{name}' not found in the filter chain."
+            )
+        for flt in self.filters:
+            flt.enabled = (flt.name == name)
+        self.active_filter_name = name
+
+    def deactivate_filter(self) -> None:
+        """
+        Disable all filters and clear the active filter tracking.
+
+        Implements toggle-off behaviour when the active widget item is
+        clicked a second time (spec-design-main-screen REQ-023, §4.5).
+        """
+        for flt in self.filters:
+            flt.enabled = False
+        self.active_filter_name = None
 
     def register_filter(self, flt: BaseFilter) -> None:
         """
