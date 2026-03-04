@@ -1,0 +1,832 @@
+````skill
+---
+name: wgpu-py
+description: >
+  Write Python code that uses wgpu-py: a Pythonic wrapper around the WebGPU
+  specification backed by wgpu-native. Covers device initialisation, render
+  pipelines, compute pipelines, buffers, textures, bind-groups, WGSL shaders,
+  and associated unit tests.
+---
+
+# wgpu-py Skill
+
+## Overview
+
+`wgpu-py` is a Python binding for the [WebGPU](https://gpuweb.github.io/gpuweb/)
+API, implemented via [`wgpu-native`](https://github.com/gfx-rs/wgpu-native)
+(a Rust library). Use it to run GPU computations and GPU rendering from Python
+without needing OpenGL, Vulkan, Metal, or DX12 directly.
+
+- Install: `pip install wgpu`
+- Rendering to a window requires `rendercanvas`: `pip install rendercanvas`
+- Official docs: <https://wgpu-py.readthedocs.io/en/stable/>
+
+---
+
+## Core Concepts
+
+| Concept | wgpu class | Purpose |
+|---------|-----------|---------|
+| API entry-point | `wgpu.gpu` (`GPU`) | `request_adapter_sync()` |
+| Adapter | `GPUAdapter` | Represents a physical/virtual GPU |
+| Device | `GPUDevice` | Central object; creates all other GPU objects |
+| Buffer | `GPUBuffer` | Raw memory on the GPU |
+| Texture | `GPUTexture` | Image data (1-D / 2-D / 3-D) |
+| Texture view | `GPUTextureView` | Typed view into a texture |
+| Sampler | `GPUSampler` | Filtering / address-mode descriptor |
+| Shader module | `GPUShaderModule` | Compiled WGSL or SPIR-V program |
+| Bind-group layout | `GPUBindGroupLayout` | Describes resource slot types |
+| Bind group | `GPUBindGroup` | Actual resource bindings used by a pipeline |
+| Pipeline layout | `GPUPipelineLayout` | Collection of bind-group layouts |
+| Compute pipeline | `GPUComputePipeline` | GPU compute dispatch |
+| Render pipeline | `GPURenderPipeline` | Vertex + fragment draw call |
+| Command encoder | `GPUCommandEncoder` | Records a series of GPU commands |
+| Render pass encoder | `GPURenderPassEncoder` | Records render commands |
+| Compute pass encoder | `GPUComputePassEncoder` | Records compute commands |
+| Queue | `GPUQueue` | Submits recorded command buffers |
+| Canvas context | `GPUCanvasContext` | Bridge to a window surface |
+
+---
+
+## Python Conventions to Follow
+
+Always follow the project Python conventions:
+
+- Use **PEP 8** style and 4-space indentation.
+- Add **type hints** to all function signatures (use
+  `from __future__ import annotations` for forward references).
+- Write **docstrings** (PEP 257) for every public function, class, and module.
+- Lines must not exceed **79 characters**.
+- Use `numpy` (`np.ndarray`) for array data passed to / received from the GPU.
+- Provide **unit tests** for every non-trivial function; use `pytest`.
+
+---
+
+## Device Initialisation
+
+### Quick (recommended for most scripts)
+
+```python
+import wgpu
+from wgpu.utils import get_default_device
+
+
+def get_device() -> wgpu.GPUDevice:
+    """Return the shared default GPU device.
+
+    Uses ``wgpu.utils.get_default_device()`` which manages a single
+    global device so that buffers and textures are sharable across
+    modules.
+
+    Returns:
+        wgpu.GPUDevice: The default GPU device instance.
+    """
+    return get_default_device()
+```
+
+### Explicit adapter + device (fine-grained control)
+
+```python
+import wgpu
+
+
+def create_device(
+    power_preference: str = "high-performance",
+) -> wgpu.GPUDevice:
+    """Create a GPU device from the best available adapter.
+
+    Parameters:
+        power_preference: Either ``"high-performance"`` or
+            ``"low-power"``.
+
+    Returns:
+        wgpu.GPUDevice: A new GPU device.
+    """
+    adapter: wgpu.GPUAdapter = wgpu.gpu.request_adapter_sync(
+        power_preference=power_preference
+    )
+    return adapter.request_device_sync()
+```
+
+---
+
+## Buffers
+
+Buffers hold arbitrary binary data on the GPU (vertex data, uniforms,
+storage arrays, etc.).
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import wgpu
+
+
+def create_storage_buffer(
+    device: wgpu.GPUDevice,
+    data: np.ndarray,
+    label: str = "storage_buffer",
+) -> wgpu.GPUBuffer:
+    """Upload a numpy array to a GPU storage buffer.
+
+    The buffer is created with STORAGE | COPY_SRC | COPY_DST usage so
+    it can be read back from Python and used in shaders.
+
+    Parameters:
+        device: The GPU device.
+        data:   A numpy array whose bytes will be uploaded.
+        label:  Human-readable label shown in GPU debug tooling.
+
+    Returns:
+        wgpu.GPUBuffer: The populated GPU buffer.
+    """
+    raw = data.tobytes()
+    buffer = device.create_buffer_with_data(
+        data=raw,
+        usage=(
+            wgpu.BufferUsage.STORAGE
+            | wgpu.BufferUsage.COPY_SRC
+            | wgpu.BufferUsage.COPY_DST
+        ),
+        label=label,
+    )
+    return buffer
+
+
+def read_buffer_as_array(
+    device: wgpu.GPUDevice,
+    buffer: wgpu.GPUBuffer,
+    dtype: np.dtype,
+) -> np.ndarray:
+    """Download a GPU buffer and return it as a numpy array.
+
+    Parameters:
+        device: The GPU device.
+        buffer: The buffer to read.
+        dtype:  The numpy dtype used to interpret the bytes
+                (e.g. ``np.float32``).
+
+    Returns:
+        np.ndarray: Array containing the buffer contents.
+    """
+    raw: memoryview = device.queue.read_buffer(buffer)
+    return np.frombuffer(raw, dtype=dtype).copy()
+```
+
+---
+
+## Compute Pipelines
+
+### Low-level approach
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import wgpu
+
+
+DOUBLE_WGSL = """
+@group(0) @binding(0) var<storage, read>       input  : array<f32>;
+@group(0) @binding(1) var<storage, read_write> output : array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&input)) {
+        output[i] = input[i] * 2.0;
+    }
+}
+"""
+
+
+def run_double_compute(
+    device: wgpu.GPUDevice,
+    values: np.ndarray,
+) -> np.ndarray:
+    """Double every element of ``values`` on the GPU.
+
+    Parameters:
+        device: The GPU device.
+        values: A 1-D float32 numpy array.
+
+    Returns:
+        np.ndarray: A new float32 array with each element doubled.
+    """
+    n = len(values)
+    byte_size = values.nbytes
+
+    # --- Buffers ---
+    input_buf = device.create_buffer_with_data(
+        data=values.tobytes(),
+        usage=wgpu.BufferUsage.STORAGE,
+        label="input_buffer",
+    )
+    output_buf = device.create_buffer(
+        size=byte_size,
+        usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
+        label="output_buffer",
+    )
+
+    # --- Shader ---
+    shader = device.create_shader_module(code=DOUBLE_WGSL)
+
+    # --- Bind group layout ---
+    bgl = device.create_bind_group_layout(
+        entries=[
+            {
+                "binding": 0,
+                "visibility": wgpu.ShaderStage.COMPUTE,
+                "buffer": {
+                    "type": wgpu.BufferBindingType.read_only_storage
+                },
+            },
+            {
+                "binding": 1,
+                "visibility": wgpu.ShaderStage.COMPUTE,
+                "buffer": {"type": wgpu.BufferBindingType.storage},
+            },
+        ],
+    )
+
+    # --- Bind group ---
+    bind_group = device.create_bind_group(
+        layout=bgl,
+        entries=[
+            {"binding": 0, "resource": {"buffer": input_buf}},
+            {"binding": 1, "resource": {"buffer": output_buf}},
+        ],
+    )
+
+    # --- Pipeline ---
+    pipeline_layout = device.create_pipeline_layout(
+        bind_group_layouts=[bgl]
+    )
+    pipeline = device.create_compute_pipeline(
+        layout=pipeline_layout,
+        compute={"module": shader, "entry_point": "main"},
+    )
+
+    # --- Dispatch ---
+    encoder = device.create_command_encoder()
+    pass_ = encoder.begin_compute_pass()
+    pass_.set_pipeline(pipeline)
+    pass_.set_bind_group(0, bind_group)
+    workgroups = (n + 63) // 64
+    pass_.dispatch_workgroups(workgroups)
+    pass_.end()
+    device.queue.submit([encoder.finish()])
+
+    # --- Read back ---
+    raw = device.queue.read_buffer(output_buf)
+    return np.frombuffer(raw, dtype=np.float32).copy()
+```
+
+### Convenience helper (`compute_with_buffers`)
+
+For quick, one-shot compute dispatches use the utility helper:
+
+```python
+import numpy as np
+from wgpu.utils.compute import compute_with_buffers
+
+
+SQUARE_WGSL = """
+@group(0) @binding(0) var<storage, read>       input  : array<f32>;
+@group(0) @binding(1) var<storage, read_write> output : array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    output[i] = input[i] * input[i];
+}
+"""
+
+
+def square_array(values: np.ndarray) -> np.ndarray:
+    """Square every element of ``values`` using a GPU compute shader.
+
+    Uses ``compute_with_buffers`` which handles device creation,
+    buffer setup, and dispatch automatically.
+
+    Parameters:
+        values: A 1-D float32 numpy array.
+
+    Returns:
+        np.ndarray: A float32 array with each element squared.
+    """
+    n = len(values)
+    result = compute_with_buffers(
+        input_arrays={0: values.astype(np.float32)},
+        output_arrays={1: (n, "f")},
+        shader=SQUARE_WGSL,
+        n=n,
+    )
+    return np.array(result[1], dtype=np.float32)
+```
+
+---
+
+## Render Pipelines (offscreen)
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import wgpu
+
+
+# NDC triangle — positions and per-vertex colours embedded in shader.
+TRIANGLE_WGSL = """
+struct VertexOutput {
+    @builtin(position) pos   : vec4<f32>,
+    @location(0)       color : vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi : u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>( 0.0,  0.8),
+        vec2<f32>(-0.8, -0.8),
+        vec2<f32>( 0.8, -0.8),
+    );
+    var colors = array<vec4<f32>, 3>(
+        vec4<f32>(1.0, 0.0, 0.0, 1.0),
+        vec4<f32>(0.0, 1.0, 0.0, 1.0),
+        vec4<f32>(0.0, 0.0, 1.0, 1.0),
+    );
+    var out : VertexOutput;
+    out.pos   = vec4<f32>(positions[vi], 0.0, 1.0);
+    out.color = colors[vi];
+    return out;
+}
+
+@fragment
+fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"""
+
+TEXTURE_FORMAT = wgpu.TextureFormat.rgba8unorm
+
+
+def render_triangle_offscreen(
+    device: wgpu.GPUDevice,
+    width: int = 256,
+    height: int = 256,
+) -> np.ndarray:
+    """Render a coloured triangle offscreen and return it as RGBA pixels.
+
+    Parameters:
+        device: The GPU device.
+        width:  Output image width in pixels.
+        height: Output image height in pixels.
+
+    Returns:
+        np.ndarray: Shape ``(height, width, 4)`` uint8 RGBA array.
+    """
+    # --- Render target texture ---
+    texture = device.create_texture(
+        size=(width, height, 1),
+        format=TEXTURE_FORMAT,
+        usage=(
+            wgpu.TextureUsage.RENDER_ATTACHMENT
+            | wgpu.TextureUsage.COPY_SRC
+        ),
+        label="render_target",
+    )
+    texture_view = texture.create_view()
+
+    # --- Shader ---
+    shader = device.create_shader_module(code=TRIANGLE_WGSL)
+
+    # --- Render pipeline (layout="auto" infers bind-group layouts) ---
+    pipeline = device.create_render_pipeline(
+        layout="auto",
+        vertex={"module": shader, "entry_point": "vs_main"},
+        fragment={
+            "module": shader,
+            "entry_point": "fs_main",
+            "targets": [{"format": TEXTURE_FORMAT}],
+        },
+        primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
+    )
+
+    # --- Render pass ---
+    encoder = device.create_command_encoder()
+    render_pass = encoder.begin_render_pass(
+        color_attachments=[
+            {
+                "view": texture_view,
+                "resolve_target": None,
+                "clear_value": (0.1, 0.1, 0.1, 1.0),
+                "load_op": wgpu.LoadOp.clear,
+                "store_op": wgpu.StoreOp.store,
+            }
+        ],
+    )
+    render_pass.set_pipeline(pipeline)
+    render_pass.draw(3)  # 3 vertices, no index buffer
+    render_pass.end()
+    device.queue.submit([encoder.finish()])
+
+    # --- Read back pixels ---
+    raw = device.queue.read_texture(
+        {"texture": texture, "mip_level": 0, "origin": (0, 0, 0)},
+        {"offset": 0, "bytes_per_row": width * 4},
+        (width, height, 1),
+    )
+    pixels = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 4)
+    return pixels.copy()
+```
+
+---
+
+## Rendering to a Window (on-screen)
+
+```python
+from __future__ import annotations
+
+import wgpu
+from rendercanvas.auto import RenderCanvas, loop
+
+CLEAR_WGSL = """
+@vertex
+fn vs_main(
+    @builtin(vertex_index) vi : u32,
+) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>( 0.0,  0.5),
+        vec2<f32>(-0.5, -0.5),
+        vec2<f32>( 0.5, -0.5),
+    );
+    return vec4<f32>(pos[vi], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.2, 0.5, 0.9, 1.0);
+}
+"""
+
+
+def run_windowed_app() -> None:
+    """Open a window and render a blue triangle using wgpu-py.
+
+    This function enters the rendercanvas event loop and will block
+    until the window is closed.
+    """
+    canvas = RenderCanvas(
+        title="wgpu triangle",
+        update_mode="continuous",
+    )
+
+    adapter: wgpu.GPUAdapter = wgpu.gpu.request_adapter_sync(
+        power_preference="high-performance"
+    )
+    device: wgpu.GPUDevice = adapter.request_device_sync()
+
+    present_context = canvas.get_wgpu_context()
+    render_format = present_context.get_preferred_format(device.adapter)
+    present_context.configure(device=device, format=render_format)
+
+    shader = device.create_shader_module(code=CLEAR_WGSL)
+    pipeline = device.create_render_pipeline(
+        layout="auto",
+        vertex={"module": shader, "entry_point": "vs_main"},
+        fragment={
+            "module": shader,
+            "entry_point": "fs_main",
+            "targets": [{"format": render_format}],
+        },
+        primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
+    )
+
+    def draw_frame() -> None:
+        """Record and submit one frame of rendering."""
+        encoder = device.create_command_encoder()
+        current_view = present_context.get_current_texture()
+        render_pass = encoder.begin_render_pass(
+            color_attachments=[
+                {
+                    "view": current_view,
+                    "resolve_target": None,
+                    "clear_value": (0.05, 0.05, 0.05, 1.0),
+                    "load_op": wgpu.LoadOp.clear,
+                    "store_op": wgpu.StoreOp.store,
+                }
+            ],
+        )
+        render_pass.set_pipeline(pipeline)
+        render_pass.draw(3)
+        render_pass.end()
+        device.queue.submit([encoder.finish()])
+
+    canvas.request_draw(draw_frame)
+    loop.run()
+
+
+if __name__ == "__main__":
+    run_windowed_app()
+```
+
+---
+
+## Textures and Samplers
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import wgpu
+
+
+def upload_rgba_texture(
+    device: wgpu.GPUDevice,
+    pixels: np.ndarray,
+    label: str = "texture",
+) -> wgpu.GPUTextureView:
+    """Upload an RGBA uint8 image to the GPU.
+
+    Parameters:
+        device: The GPU device.
+        pixels: Shape ``(H, W, 4)`` uint8 numpy array.
+        label:  Human-readable debug label.
+
+    Returns:
+        wgpu.GPUTextureView: A 2-D view of the uploaded texture.
+    """
+    height, width = pixels.shape[:2]
+    texture = device.create_texture(
+        size=(width, height, 1),
+        format=wgpu.TextureFormat.rgba8unorm,
+        usage=(
+            wgpu.TextureUsage.TEXTURE_BINDING
+            | wgpu.TextureUsage.COPY_DST
+        ),
+        label=label,
+    )
+    device.queue.write_texture(
+        {"texture": texture, "mip_level": 0, "origin": (0, 0, 0)},
+        pixels.tobytes(),
+        {"bytes_per_row": width * 4, "rows_per_image": height},
+        (width, height, 1),
+    )
+    return texture.create_view()
+
+
+def create_linear_sampler(device: wgpu.GPUDevice) -> wgpu.GPUSampler:
+    """Create a linear sampler with repeat address mode.
+
+    Parameters:
+        device: The GPU device.
+
+    Returns:
+        wgpu.GPUSampler: A sampler using linear min/mag filtering.
+    """
+    return device.create_sampler(
+        min_filter=wgpu.FilterMode.linear,
+        mag_filter=wgpu.FilterMode.linear,
+        address_mode_u=wgpu.AddressMode.repeat,
+        address_mode_v=wgpu.AddressMode.repeat,
+    )
+```
+
+---
+
+## WGSL Shader Guidelines
+
+- WGSL is the shading language for WebGPU / wgpu-py.
+- Use `@group(G) @binding(B)` annotations to match Python bind-group setup.
+- Use `var<storage, read>` for input-only buffers and
+  `var<storage, read_write>` for output buffers in compute shaders.
+- Use `@workgroup_size(64)` as a sensible default for 1-D compute dispatches.
+- Reference: <https://www.w3.org/TR/WGSL/>
+
+```wgsl
+// Example: element-wise multiply of two arrays
+@group(0) @binding(0) var<storage, read>       a : array<f32>;
+@group(0) @binding(1) var<storage, read>       b : array<f32>;
+@group(0) @binding(2) var<storage, read_write> c : array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&a)) {
+        c[i] = a[i] * b[i];
+    }
+}
+```
+
+---
+
+## Coordinate System
+
+- NDC (Normalised Device Coordinates): X ∈ [−1, 1], Y ∈ [−1, 1], Z ∈ [0, 1].
+- **Y-axis points upward** in NDC — the top of the screen is `y = +1`.
+- Vertices outside these ranges are silently clipped.
+
+---
+
+## Debugging Tips
+
+- Set `WGPU_BACKEND_TYPE` env var to `"Vulkan"`, `"Metal"`, `"D3D12"`, or
+  `"OpenGL"` to force a specific backend.
+- Enable verbose logging:
+  ```python
+  import logging
+  logging.getLogger("wgpu").setLevel(logging.DEBUG)
+  ```
+- Give GPU objects a `label` argument — labels appear in validation errors
+  and in RenderDoc.
+- Run the application via [RenderDoc](https://renderdoc.org/) to capture a
+  frame and inspect all draw calls and resource states.
+- Print adapter / device diagnostics:
+  ```python
+  wgpu.diagnostics.print_report()
+  ```
+
+---
+
+## Unit Testing
+
+### Principles
+
+- Each test must be **self-contained** and not depend on global mutable state.
+- Tests that exercise GPU paths require a real or software-fallback device.
+- Name test functions `test_<what_is_tested>`.
+- Assert specific output values rather than just checking types.
+- Use `pytest.approx` or `numpy.testing` for floating-point comparisons.
+- Use a **session-scoped** `device` fixture to avoid repeated initialisation.
+
+### Example test file
+
+```python
+"""Tests for GPU compute utilities.
+
+These tests verify that GPU compute shaders produce correct numerical
+results. A default wgpu device is created once per session to avoid
+repeated initialisation overhead.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import wgpu
+from wgpu.utils import get_default_device
+from wgpu.utils.compute import compute_with_buffers
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def device() -> wgpu.GPUDevice:
+    """Return a shared GPU device for the entire test session.
+
+    Session scope avoids expensive re-initialisation for each test
+    while keeping individual tests fully independent.
+    """
+    return get_default_device()
+
+
+# ---------------------------------------------------------------------------
+# Production helper under test
+# ---------------------------------------------------------------------------
+
+DOUBLE_WGSL = """
+@group(0) @binding(0) var<storage, read>       input  : array<f32>;
+@group(0) @binding(1) var<storage, read_write> output : array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&input)) {
+        output[i] = input[i] * 2.0;
+    }
+}
+"""
+
+
+def gpu_double(
+    device: wgpu.GPUDevice,
+    values: np.ndarray,
+) -> np.ndarray:
+    """Return a new array with every element of ``values`` doubled."""
+    n = len(values)
+    result = compute_with_buffers(
+        input_arrays={0: values.astype(np.float32)},
+        output_arrays={1: (n, "f")},
+        shader=DOUBLE_WGSL,
+        n=n,
+    )
+    return np.array(result[1], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class TestGpuDouble:
+    """Test suite for the gpu_double compute helper."""
+
+    def test_basic_values(self, device: wgpu.GPUDevice) -> None:
+        """gpu_double should return each input element multiplied by 2."""
+        values = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        result = gpu_double(device, values)
+        expected = np.array([2.0, 4.0, 6.0, 8.0], dtype=np.float32)
+        np.testing.assert_allclose(result, expected, rtol=1e-6)
+
+    def test_zero_input(self, device: wgpu.GPUDevice) -> None:
+        """gpu_double of all-zeros should return all-zeros."""
+        values = np.zeros(16, dtype=np.float32)
+        result = gpu_double(device, values)
+        np.testing.assert_array_equal(
+            result, np.zeros(16, dtype=np.float32)
+        )
+
+    def test_negative_values(self, device: wgpu.GPUDevice) -> None:
+        """gpu_double should correctly handle negative inputs."""
+        values = np.array([-1.0, -2.5, 0.5], dtype=np.float32)
+        result = gpu_double(device, values)
+        np.testing.assert_allclose(result, values * 2.0, rtol=1e-6)
+
+    def test_large_array(self, device: wgpu.GPUDevice) -> None:
+        """gpu_double handles arrays larger than one workgroup (64)."""
+        values = np.arange(256, dtype=np.float32)
+        result = gpu_double(device, values)
+        np.testing.assert_allclose(result, values * 2.0, rtol=1e-6)
+
+    def test_returns_copy(self, device: wgpu.GPUDevice) -> None:
+        """The returned array must not share memory with the input."""
+        values = np.array([1.0, 2.0], dtype=np.float32)
+        result = gpu_double(device, values)
+        result[0] = 999.0  # mutate result
+        assert values[0] == pytest.approx(1.0)
+
+
+class TestBufferRoundtrip:
+    """Verify that data written to a GPU buffer can be read back intact."""
+
+    def test_float32_roundtrip(self, device: wgpu.GPUDevice) -> None:
+        """Write and read a float32 array — data must be identical."""
+        data = np.array([3.14, 2.71, 1.41], dtype=np.float32)
+        buf = device.create_buffer_with_data(
+            data=data.tobytes(),
+            usage=wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
+        )
+        raw = device.queue.read_buffer(buf)
+        result = np.frombuffer(raw, dtype=np.float32)
+        np.testing.assert_allclose(result, data, rtol=1e-6)
+
+    def test_uint8_roundtrip(self, device: wgpu.GPUDevice) -> None:
+        """Write and read uint8 data — bytes must be identical."""
+        data = np.array([0, 127, 255, 64], dtype=np.uint8)
+        buf = device.create_buffer_with_data(
+            data=data.tobytes(),
+            usage=wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
+        )
+        raw = device.queue.read_buffer(buf)
+        result = np.frombuffer(raw, dtype=np.uint8)
+        np.testing.assert_array_equal(result, data)
+```
+
+---
+
+## Common Pitfalls
+
+| Pitfall | Fix |
+|---------|-----|
+| Forgetting `COPY_SRC` on output buffers | Add `wgpu.BufferUsage.COPY_SRC` when you need `read_buffer()`. |
+| Binding index mismatch | Ensure `@binding(N)` in WGSL matches `"binding": N` in `create_bind_group`. |
+| Wrong `bytes_per_row` for textures | Must be a multiple of 256 when copying textures via the queue. |
+| Y-axis confusion | Screen top → NDC `y = +1`; screen bottom → NDC `y = -1`. |
+| Shared vs per-frame device | Use `get_default_device()` so all modules share the same device. |
+| Mutating a `memoryview` return | Call `.copy()` or `np.frombuffer(raw, ...).copy()` before modifying. |
+
+---
+
+## Key API Quick Reference
+
+| Operation | Python call |
+|-----------|------------|
+| Get default device | `wgpu.utils.get_default_device()` |
+| Request adapter | `wgpu.gpu.request_adapter_sync(power_preference=...)` |
+| Request device | `adapter.request_device_sync()` |
+| Create buffer | `device.create_buffer(size=..., usage=...)` |
+| Create buffer with data | `device.create_buffer_with_data(data=..., usage=...)` |
+| Write buffer | `device.queue.write_buffer(buffer, offset, data)` |
+| Read buffer | `device.queue.read_buffer(buffer)` |
+| Create texture | `device.create_texture(size=..., format=..., usage=...)` |
+| Write texture | `device.queue.write_texture(dest, data, layout, size)` |
+| Read texture | `device.queue.read_texture(source, layout, size)` |
+| Create shader | `device.create_shader_module(code=wgsl_string)` |
+| Create compute pipeline | `device.create_compute_pipeline(layout=..., compute=...)` |
+| Create render pipeline | `device.create_render_pipeline(layout=..., vertex=..., ...)` |
+| Command encoder | `device.create_command_encoder()` |
+| Submit commands | `device.queue.submit([encoder.finish()])` |
+| Print diagnostics | `wgpu.diagnostics.print_report()` |
+````
+
+
