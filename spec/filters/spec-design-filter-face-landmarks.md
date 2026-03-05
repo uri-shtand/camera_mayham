@@ -1,85 +1,105 @@
 ---
 title: Face Landmark Visualisation Filter
-version: 1.0
+version: 2.0
 date_created: 2026-03-05
-last_updated: 2026-03-05
+last_updated: 2026-03-06
 tags: [design, filter, face-tracking, gpu, wgpu]
 ---
 
-# Introduction
+# Face Landmark Visualisation Filter
 
-This specification defines the **Face Landmark Visualisation Filter** for Camera Mayham.  The filter overlays all 478 MediaPipe face landmarks as coloured dots directly on the live camera feed using WebGPU (wgpu) GPU rendering.  It integrates with the existing filter chain architecture and the face tracking system without modifying either component's public contract.
-
----
-
-## 1. Purpose & Scope
-
-**Purpose:** Define the requirements, GPU rendering design, data contracts, and acceptance criteria for a filter that renders MediaPipe facial landmark points on the camera feed.
-
-**Scope:** Covers the `FaceLandmarkFilter` class in `filters/face_landmarks.py`, the changes needed to the rendering pipeline to supply face tracking data to the filter, and the corresponding unit tests.
-
-**Audience:** Engineers implementing the filter; AI systems extending Camera Mayham.
-
-**Assumptions:**
-- The `FaceTracker` produces a `FaceTrackResult` with up to 478 `Landmark` entries each with normalised `x, y ∈ [0, 1]` coordinates (0 = top/left, 1 = bottom/right).
-- The rendering pipeline operates in the coordinate space described in `spec/main.md`.
-- No GPU-side changes to `FilterPass` or `BaseFilter` interface are required.
+The Face Landmark Visualisation Filter overlays all 478 MediaPipe face landmarks on the live camera feed as white dots, adds head-pose arrows to show facial orientation, and displays a clear face-detected indicator. Rendering is done on the GPU via WebGPU (wgpu) so there is no CPU overhead in the hot render loop. The filter plugs into the existing filter chain without changing any shared interfaces.
 
 ---
 
-## 2. Definitions
+## 1. What the User Sees
 
-| Term | Definition |
-|------|------------|
-| **Landmark** | A normalised 3-D facial point detected by MediaPipe; `x, y` are in `[0, 1]` relative to frame size |
-| **NDC** | Normalised Device Coordinates — the WebGPU clip-space coordinate system where x ∈ [-1, 1] (left→right) and y ∈ [-1, 1] (bottom→top) |
-| **Ping-pong textures** | Two alternating GPU textures used by the filter chain so each filter reads from one and writes to the other |
-| **Instanced draw** | A single GPU draw call that renders the same geometry (a quad) once per landmark instance |
-| **SDF** | Signed Distance Field — a technique used in the fragment shader to produce smooth circular dots |
-| **Blit pass** | A full-screen triangle draw that copies one texture to another, acting as a pass-through |
-| **Alpha blending** | GPU compositing mode that blends a semi-transparent source over an existing pixel based on the source alpha value |
-| **FaceTrackResult** | Dataclass returned by `FaceTracker.process()`, containing landmark list and a `face_detected` flag |
+When the filter is active the camera feed shows three layers on top of the video:
 
----
+1. **Landmark dots** — 478 small white circles, one at each MediaPipe facial keypoint (eyes, nose, mouth, jawline, etc.).
+2. **Head-pose arrows** — three arrows drawn from a fixed origin in the **top-left corner** of the frame, pointing in the directions of the face's pitch (up/down), yaw (left/right), and roll (tilt) axes. The arrow lengths scale with the magnitude of each angle.
+3. **Face-detected indicator** — a small badge in the top-right corner of the frame:
+   - Green circle + check when a face is detected.
+   - Red circle + cross when no face is detected.
 
-## 3. Requirements, Constraints & Guidelines
-
-### Functional Requirements
-
-- **REQ-LM-001**: The filter shall render a dot at each detected MediaPipe face landmark position on the camera frame.
-- **REQ-LM-002**: When no face is detected (`FaceTrackResult.face_detected == False` or `face_result is None`) the filter shall act as a pass-through, leaving the frame unmodified.
-- **REQ-LM-003**: The filter shall expose runtime-adjustable parameters: `dot_radius` (float, pixels), `dot_r`, `dot_g`, `dot_b`, `dot_a` (float, colour components `[0, 1]`).
-- **REQ-LM-004**: The filter shall accept updated face tracking data each frame via a dedicated `update_face_result` method.
-- **REQ-LM-005**: Landmark dots shall be rendered with smooth circular edges using a fragment-shader SDF and alpha blending over the camera frame.
-- **REQ-LM-006**: The filter name reported by the `name` property shall be `"Face Landmarks"`.
-
-### Constraints
-
-- **CON-LM-001**: The filter must conform to the `BaseFilter` interface — `setup`, `_build_pipeline`, `apply`, `teardown`.
-- **CON-LM-002**: `apply` must not allocate new GPU textures or buffers; vertex and uniform buffers are pre-allocated in `_build_pipeline`.
-- **CON-LM-003**: The maximum number of landmarks supported is 478 (`MAX_LANDMARKS`); the vertex buffer is pre-allocated to this capacity.
-- **CON-LM-004**: The filter uses two render passes within a single `apply` call: a blit pass (input → output) followed by a landmark overlay pass (load output, draw circles).
-- **CON-LM-005**: The face tracker result must be injected via `update_face_result`; the filter does not hold a reference to `AppState` or `FaceTracker`.
-
-### Guidelines
-
-- **GUD-LM-001**: Default colour should be bright green (`dot_r=0.0, dot_g=1.0, dot_b=0.0, dot_a=1.0`) for maximum contrast.
-- **GUD-LM-002**: Default dot radius should be `3.0` pixels.
-- **GUD-LM-003**: Coordinate conversion from MediaPipe normalised space to NDC: `ndc_x = x * 2 - 1`, `ndc_y = 1 - y * 2` (flip Y because MediaPipe y increases downward, NDC y increases upward).
-- **GUD-LM-004**: NDC radius must be aspect-ratio corrected: `radius_x = 2 * dot_radius / width`, `radius_y = 2 * dot_radius / height`, derived from the input texture dimensions at apply time.
+When no face is present only the badge is shown; the dots and arrows disappear.
 
 ---
 
-## 4. Interfaces & Data Contracts
+## 2. Scope
 
-### 4.1 Class: `FaceLandmarkFilter(BaseFilter)`
+| In scope | Out of scope |
+|----------|--------------|
+| `FaceLandmarkFilter` class in `filters/face_landmarks.py` | Changes to `BaseFilter` or `FilterPass` interfaces |
+| Dot, arrow, and badge rendering on the GPU | Exposing dot colour or dot size as user-adjustable settings |
+| Pipeline integration in `rendering/pipeline.py` | Training or tracking logic inside `tracking/` |
+| Unit tests in `tests/test_face_landmark_filter.py` | Any UI controls beyond the filter on/off toggle |
+
+---
+
+## 3. Definitions
+
+| Term | Meaning |
+|------|---------|
+| **Landmark** | A normalised 3-D facial point from MediaPipe; `x, y ∈ [0, 1]` with `(0, 0)` at top-left |
+| **NDC** | Normalised Device Coordinates — WebGPU clip space where `x, y ∈ [-1, 1]` with `(0, 0)` at screen centre |
+| **Head pose** | The orientation of the face in 3-D space, expressed as pitch, yaw, and roll angles derived from landmark geometry |
+| **Instanced draw** | A single GPU draw call that renders the same quad geometry once per landmark using per-instance position data |
+| **SDF circle** | A fragment shader technique that computes a smooth circle by measuring distance from a point centre |
+| **Blit pass** | A full-screen draw that copies one GPU texture to another unchanged |
+| **FaceTrackResult** | Dataclass from `FaceTracker.process()` containing the landmark list, a `face_detected` flag, and head-pose angles |
+
+---
+
+## 4. Requirements
+
+### 4.1 Landmark Dots
+
+- **REQ-LM-001** The filter renders a white dot at each of the 478 detected landmark positions.
+- **REQ-LM-002** Dots are rendered as smooth SDF circles with a fixed radius of 3 px and colour `rgba(1, 1, 1, 1)` (opaque white). These values are hard-coded and not exposed to the user.
+- **REQ-LM-003** When no face is detected the dots are hidden and the frame is passed through unmodified.
+
+### 4.2 Head-Pose Arrows
+
+- **REQ-LM-004** Three arrows are drawn from a fixed origin in the top-left corner of the frame along the pitch, yaw, and roll axes of the detected face.
+- **REQ-LM-005** Arrow colour and direction follow the axis convention:
+  - **Yaw** (left/right rotation) — blue arrow.
+  - **Pitch** (up/down rotation) — green arrow.
+  - **Roll** (tilt) — red arrow.
+- **REQ-LM-006** Arrow length is proportional to the magnitude of the corresponding angle, capped at a sensible maximum so they remain inside the frame.
+- **REQ-LM-007** When no face is detected the arrows are hidden.
+
+### 4.3 Face-Detected Indicator
+
+- **REQ-LM-008** A badge is always visible in the top-right corner of the frame regardless of whether a face is detected.
+- **REQ-LM-009** When a face is detected the badge shows a **green filled circle** with a white check mark (✓).
+- **REQ-LM-010** When no face is detected the badge shows a **red filled circle** with a white cross (✗).
+
+### 4.4 Integration
+
+- **REQ-LM-011** The filter receives face tracking data each frame via `update_face_result(result)`. It does not hold a reference to `AppState` or `FaceTracker`.
+- **REQ-LM-012** The filter name property returns `"Face Landmarks"`.
+
+---
+
+## 5. Constraints
+
+- **CON-LM-001** The filter must implement the `BaseFilter` interface: `setup`, `_build_pipeline`, `apply`, `teardown`.
+- **CON-LM-002** `apply` must not allocate new GPU buffers or textures; all buffers are pre-allocated in `_build_pipeline`.
+- **CON-LM-003** The vertex buffer supports at most 478 landmarks (`MAX_LANDMARKS`).
+- **CON-LM-004** `apply` uses a two-pass strategy: a blit pass that copies the input to the output, then an overlay pass that draws dots, arrows, and the badge on top.
+
+---
+
+## 6. Data Contracts
+
+### 6.1 Class Interface
 
 File: `filters/face_landmarks.py`
 
 ```python
 class FaceLandmarkFilter(BaseFilter):
     name: str  # "Face Landmarks"
-    params: Dict[str, Any]  # see Parameter Table below
 
     def update_face_result(
         self, result: Optional[FaceTrackResult]
@@ -100,45 +120,50 @@ class FaceLandmarkFilter(BaseFilter):
     def teardown(self) -> None: ...
 ```
 
-### 4.2 Parameters
+`FaceLandmarkFilter` has no user-facing `params` dictionary. All visual properties are fixed.
 
-| Parameter | Type | Default | Range | Description |
-|-----------|------|---------|-------|-------------|
-| `dot_radius` | float | `3.0` | `1.0 – 20.0` | Dot radius in pixels |
-| `dot_r` | float | `0.0` | `0.0 – 1.0` | Red channel of dot colour |
-| `dot_g` | float | `1.0` | `0.0 – 1.0` | Green channel of dot colour |
-| `dot_b` | float | `0.0` | `0.0 – 1.0` | Blue channel of dot colour |
-| `dot_a` | float | `1.0` | `0.0 – 1.0` | Alpha of dot colour |
+### 6.2 GPU Resources
 
-### 4.3 GPU Resource Layout
-
-| Resource | Type | Size | Usage |
-|----------|------|------|-------|
-| `_blit_bgl` | BindGroupLayout | — | Bindings 0 (texture), 1 (sampler) |
-| `_landmark_bgl` | BindGroupLayout | — | Binding 0 (uniform buffer) |
-| `_landmark_param_buffer` | GPUBuffer | 32 bytes | `UNIFORM \| COPY_DST` — LandmarkParams struct |
+| Resource | Type | Size | Purpose |
+|----------|------|------|---------|
+| `_blit_bgl` | BindGroupLayout | — | Bindings 0 (texture) + 1 (sampler) for the blit pass |
+| `_landmark_bgl` | BindGroupLayout | — | Binding 0 (uniform) for the overlay pass |
+| `_landmark_param_buffer` | GPUBuffer | 32 bytes | `UNIFORM \| COPY_DST` — dot radius, colour, NDC scale |
 | `_landmark_vertex_buffer` | GPUBuffer | 478 × 8 bytes | `VERTEX \| COPY_DST` — per-instance NDC positions |
-| `_blit_pipeline` | GPURenderPipeline | — | Full-screen blit, no blend |
-| `_landmark_pipeline` | GPURenderPipeline | — | Instanced circles, alpha blend |
+| `_blit_pipeline` | GPURenderPipeline | — | Full-screen blit |
+| `_landmark_pipeline` | GPURenderPipeline | — | Instanced SDF circles with alpha blend |
 
-### 4.4 WGSL Uniform: `LandmarkParams` (32 bytes, binding 0, group 0)
+### 6.3 WGSL Uniform: `LandmarkParams` (32 bytes)
 
 ```wgsl
 struct LandmarkParams {
-    dot_r    : f32,   // offset  0
-    dot_g    : f32,   // offset  4
-    dot_b    : f32,   // offset  8
-    dot_a    : f32,   // offset 12
-    radius_x : f32,   // offset 16 — NDC half-width
-    radius_y : f32,   // offset 20 — NDC half-height
+    dot_r    : f32,   // offset  0  — fixed: 1.0
+    dot_g    : f32,   // offset  4  — fixed: 1.0
+    dot_b    : f32,   // offset  8  — fixed: 1.0
+    dot_a    : f32,   // offset 12  — fixed: 1.0
+    radius_x : f32,   // offset 16  — NDC half-width  (aspect-ratio corrected)
+    radius_y : f32,   // offset 20  — NDC half-height (aspect-ratio corrected)
     _pad0    : f32,   // offset 24
     _pad1    : f32,   // offset 28
 }
 ```
 
-### 4.5 Pipeline Integration (`rendering/pipeline.py`)
+`radius_x` and `radius_y` are derived each frame from the 3 px dot radius and the current texture dimensions: `radius_x = 2 * 3.0 / width`, `radius_y = 2 * 3.0 / height`.
 
-Before recording the filter pass, `render_frame` must call `update_face_result` on every enabled filter that exposes the method (duck-typing; no interface change to `BaseFilter`):
+### 6.4 Coordinate Conversion
+
+MediaPipe normalised coordinates map to NDC as follows:
+
+```
+ndc_x =  x * 2 - 1
+ndc_y =  1 - y * 2      # flip Y: MediaPipe y grows downward, NDC y grows upward
+```
+
+Boundary check: `(0, 0)` → `(-1, 1)` top-left; `(1, 1)` → `(1, -1)` bottom-right; `(0.5, 0.5)` → `(0, 0)` centre.
+
+### 6.5 Pipeline Integration
+
+`rendering/pipeline.py` must push the latest face result into every filter that supports it before recording the filter pass:
 
 ```python
 for flt in state.enabled_filters():
@@ -146,58 +171,47 @@ for flt in state.enabled_filters():
         flt.update_face_result(state.face_result)
 ```
 
----
-
-## 5. Acceptance Criteria
-
-- **AC-LM-001**: Given a valid `FaceTrackResult` with 478 landmarks, When `apply` is called, Then 478 instanced quads are submitted in the landmark render pass.
-- **AC-LM-002**: Given `face_result is None`, When `apply` is called, Then only the blit pass executes and `output_texture` equals `input_texture` content.
-- **AC-LM-003**: Given `FaceTrackResult.face_detected == False`, When `apply` is called, Then only the blit pass executes.
-- **AC-LM-004**: Given a landmark with normalised coordinates `(x=0.0, y=0.0)`, Then its NDC position shall be `(-1.0, 1.0)` (top-left corner).
-- **AC-LM-005**: Given a landmark with normalised coordinates `(x=1.0, y=1.0)`, Then its NDC position shall be `(1.0, -1.0)` (bottom-right corner).
-- **AC-LM-006**: Given a landmark with normalised coordinates `(x=0.5, y=0.5)`, Then its NDC position shall be `(0.0, 0.0)` (screen centre).
-- **AC-LM-007**: The filter `name` property shall return `"Face Landmarks"`.
-- **AC-LM-008**: All five default parameters (`dot_radius`, `dot_r`, `dot_g`, `dot_b`, `dot_a`) shall be present immediately after construction.
-- **AC-LM-009**: `set_param` shall accept valid parameter keys and raise `KeyError` for unknown keys.
-- **AC-LM-010**: `update_face_result` shall store the provided `FaceTrackResult` for use in the next `apply` call.
+No changes to `BaseFilter` or `FilterPass` are required.
 
 ---
 
-## 6. Test Automation Strategy
+## 7. Acceptance Criteria
 
-- **Test Levels**: Unit only (GPU is not available in CI).
-- **Frameworks**: `pytest`; GPU resources stubbed out as `None`.
+| ID | Scenario | Expected result |
+|----|----------|-----------------|
+| AC-LM-001 | `apply` called with a valid 478-landmark result | 478 instanced quads drawn in the overlay pass |
+| AC-LM-002 | `apply` called with `face_result = None` | Only the blit pass runs; output equals input |
+| AC-LM-003 | `apply` called with `face_detected == False` | Only the blit pass runs; badge shows red cross |
+| AC-LM-004 | Landmark at `(0.0, 0.0)` | NDC position is `(-1.0, 1.0)` |
+| AC-LM-005 | Landmark at `(1.0, 1.0)` | NDC position is `(1.0, -1.0)` |
+| AC-LM-006 | Landmark at `(0.5, 0.5)` | NDC position is `(0.0, 0.0)` |
+| AC-LM-007 | `name` property read | Returns `"Face Landmarks"` |
+| AC-LM-008 | Face detected | Badge is green with check mark |
+| AC-LM-009 | No face detected | Badge is red with cross |
+| AC-LM-010 | `update_face_result` called | Result is stored and used in the next `apply` call |
+| AC-LM-011 | `apply` called with a valid result | Three head-pose arrows are drawn from the top-left corner of the frame |
+
+---
+
+## 8. Tests
+
+- **Framework**: `pytest`; GPU objects stubbed as `None`.
 - **Test file**: `tests/test_face_landmark_filter.py`
-- **Test Data Management**: `FaceTrackResult` and `Landmark` instances constructed inline.
-- **CI/CD Integration**: All tests run via `pytest` in the existing test suite.
-- **Coverage Requirements**: All public methods and the NDC conversion logic must be covered.
+- **Coverage**: NDC conversion, face-detected/not-detected branching, badge state, head-pose arrow presence, `name` property, `update_face_result` storage.
 
 ---
 
-## 7. Rationale & Context
+## 9. Rationale
 
-The face landmark visualisation filter serves as both a diagnostic tool (verifying tracker accuracy) and a creative visual effect.  Rendering is GPU-side via WebGPU to avoid adding CPU-side compositing overhead to the hot render loop.
+**Fixed white dots** — colour and size customisation add UI complexity with no meaningful user benefit for a diagnostic/creative overlay. White provides universally strong contrast against skin tones. 3 px is large enough to be visible without obscuring the underlying image.
 
-A two-pass approach within `apply` (blit then overlay) was chosen over a combined single-pass shader to reuse the standard passthrough blit pipeline, keep each shader simple, and allow the landmark pass to independently enable alpha blending without complications.
+**Head-pose arrows** — three coloured axes give an immediate spatial read of where the face is pointing, making the filter useful for both creative effects and tracking diagnostics.
 
-Per-instance vertex buffer data (two floats per landmark) is the most GPU-efficient way to handle ordered instanced draw calls in WGSL, following the same pattern established in `games/bubble_pop.py`.
+**Always-visible badge** — showing face-detected status at all times (even when no filter effects are visible) confirms at a glance that the tracker is running, which is important during setup and debugging.
 
-Injecting face data via `update_face_result` keeps `BaseFilter.apply` signature unchanged and avoids coupling the filter chain to the face tracking subsystem.
+**Two-pass GPU rendering** — blit first, then overlay keeps each shader simple, reuses the standard passthrough blit pipeline, and lets the overlay pass enable alpha blending independently.
 
----
-
-## 8. Dependencies & External Integrations
-
-### Technology Platform Dependencies
-
-- **PLT-LM-001**: `wgpu` Python bindings — WebGPU GPU pipeline, texture, buffer management.
-- **PLT-LM-002**: `mediapipe` — source of `FaceTrackResult` and `Landmark` dataclasses via `tracking.face_tracker`.
-
-### Internal Architectural Dependencies
-
-- **INF-LM-001**: `filters.base.BaseFilter` — base class; must not modify its interface.
-- **INF-LM-002**: `tracking.face_tracker.FaceTrackResult` — input data contract for landmark positions.
-- **INF-LM-003**: `rendering.pipeline.RenderPipeline.render_frame` — must be updated to call `update_face_result` on face-aware filters before the filter pass.
+**`update_face_result` injection pattern** — keeps `BaseFilter.apply` signature stable and avoids coupling filters to `AppState` or `FaceTracker`.
 
 ---
 
