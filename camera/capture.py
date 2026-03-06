@@ -143,7 +143,6 @@ class CameraCapture:
             )
             return None
 
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
         return frame  # dtype=uint8, shape=(H, W, 3), BGR
 
     def close(self) -> None:

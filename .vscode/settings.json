@@ -4,6 +4,14 @@
         ".venv\\Scripts\\python.exe": true,
         "pytest": true,
         "Test-Path": true,
-        ".venv\\Scripts\\pytest": true
+        ".venv\\Scripts\\pytest": true,
+        "/^python -m pytest tests/ -x -q 2>&1 \\| Select-Object -First 60$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^py -m pytest tests/ -x -q 2>&1 \\| Select-Object -First 60$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

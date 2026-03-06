@@ -199,11 +199,6 @@ class BackgroundPass:
         rgba[:, :, 2] = bgr_frame[:, :, 0]  # B
         rgba[:, :, 3] = 255                  # A
 
-        # Flip vertically: OpenCV origin is top-left; WebGPU textures
-        # also expect top-left but the NDC Y-axis is inverted in the VS,
-        # so we flip here once to keep the blit shader simple.
-        rgba = np.ascontiguousarray(rgba[::-1])
-
         self._device.queue.write_texture(
             {
                 "texture": self.frame_texture,
