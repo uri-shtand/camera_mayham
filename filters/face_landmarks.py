@@ -1,39 +1,41 @@
 """
 Face Landmark Visualisation Filter.
 
-Renders the 478 MediaPipe face landmarks as coloured dots overlaid on
-the live camera feed using two WebGPU render passes per frame:
+Renders three visual layers on the live camera feed each frame:
 
-1. **Blit pass** — copies ``input_texture`` to ``output_texture`` using
-   a full-screen triangle (pass-through).
-2. **Landmark overlay pass** — draws instanced circular quads at each
-   detected landmark position with alpha blending, preserving the blit
-   result underneath (``load_op="load"``).
+1. **Landmark dots** — 478 white SDF circles at each MediaPipe keypoint
+   (GPU instanced draw, alpha-blended).
+2. **Head-pose arrows** — three coloured arrows drawn from the top-left
+   corner of the frame showing yaw (blue), pitch (green), and roll (red)
+   angle magnitudes and directions (CPU-drawn, uploaded per frame).
+3. **Face-detected badge** — a green ✓ or red ✗ badge in the top-right
+   corner, always visible regardless of face detection state (CPU-drawn,
+   uploaded per frame).
+
+GPU render pass order per frame
+--------------------------------
+1. **Blit pass**: ``input_texture`` → ``output_texture`` unchanged.
+2. **Landmark pass** (only when face detected): instanced white dots,
+   alpha-blended over output.
+3. **Overlay pass** (always): CPU-drawn arrows + badge blended onto
+   output from a pre-allocated RGBA overlay texture.
 
 Coordinate conversion (MediaPipe → NDC):
-    ndc_x = landmark.x * 2 - 1          (x: 0=left,  1=right)
-    ndc_y = 1 - landmark.y * 2          (y: 0=top,   1=bottom → flip)
+    ndc_x = landmark.x * 2 - 1
+    ndc_y = 1 - landmark.y * 2   (flip Y: MediaPipe y grows downward)
 
-Face tracking data is injected each frame via
-:py:meth:`update_face_result` before :py:meth:`apply` is called by the
-render pipeline.  The filter holds no reference to ``AppState`` or
-``FaceTracker`` directly (CON-LM-005).
-
-Design decisions
-----------------
-* Two separate pipelines (blit + landmark) keep each WGSL shader small
-  and allow the landmark pipeline to enable alpha blending independently.
-* A pre-allocated vertex buffer (``MAX_LANDMARKS × 8`` bytes) holds one
-  ``vec2f`` NDC position per landmark instance (CON-LM-002).
-* Dot dimensions are aspect-ratio corrected at apply time from the
-  input texture dimensions to avoid elliptical dots (GUD-LM-004).
+Dot style is fixed: white (1, 1, 1, 1), 3 px radius. No user-adjustable
+parameters exist on this filter (REQ-LM-002).
 """
 
 from __future__ import annotations
 
+import math
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
+import cv2
+import numpy as np
 import wgpu
 
 from filters.base import BaseFilter
@@ -41,6 +43,31 @@ from tracking.face_tracker import FaceTrackResult
 
 # Maximum number of landmarks MediaPipe FaceLandmarker produces.
 MAX_LANDMARKS: int = 478
+
+# ---------------------------------------------------------------------------
+# Visual constants (hard-coded, not user-adjustable — REQ-LM-002)
+# ---------------------------------------------------------------------------
+
+# Dot style
+_DOT_RADIUS_PX: float = 3.0
+
+# Arrow drawing — all arrows originate from the top-left corner
+_ARROW_ORIGIN: tuple[int, int] = (50, 50)
+_ARROW_MAX_LEN_PX: int = 80     # pixel length at 90° rotation
+_ARROW_MAX_ANGLE: float = 90.0  # degrees that maps to max length
+_ARROW_THICKNESS: int = 2
+
+# Badge (face-detected indicator) — top-right corner
+_BADGE_RADIUS_PX: int = 18
+_BADGE_MARGIN_PX: int = 30
+
+# OpenCV draws with BGRA channel order
+_YAW_BGRA: tuple[int, int, int, int] = (255, 0, 0, 255)    # blue
+_PITCH_BGRA: tuple[int, int, int, int] = (0, 255, 0, 255)  # green
+_ROLL_BGRA: tuple[int, int, int, int] = (0, 0, 255, 255)   # red
+_GREEN_BADGE_BGRA: tuple[int, int, int, int] = (0, 180, 0, 255)
+_RED_BADGE_BGRA: tuple[int, int, int, int] = (0, 0, 200, 255)
+_WHITE_BGRA: tuple[int, int, int, int] = (255, 255, 255, 255)
 
 # ---------------------------------------------------------------------------
 # WGSL — Blit pass (full-screen triangle, pass-through texture copy)
@@ -142,55 +169,45 @@ fn fs_landmark(in: LandmarkVertexOutput) -> @location(0) vec4f {
 
 class FaceLandmarkFilter(BaseFilter):
     """
-    GPU filter that draws MediaPipe face landmarks on the camera frame.
+    GPU filter that draws face landmarks, head-pose arrows, and a badge.
 
-    Uses two render passes per :py:meth:`apply` call:
+    Three render passes per :py:meth:`apply` call:
 
     1. **Blit pass**: copies ``input_texture`` to ``output_texture``.
-    2. **Landmark pass**: draws instanced circles on top with alpha
-       blending.
+    2. **Landmark pass** (face detected only): 478 instanced white SDF
+       circles, alpha-blended onto the output.
+    3. **Overlay pass** (always): CPU-drawn arrows and face-detected
+       badge alpha-blended onto the output.
 
-    Face tracking data must be supplied each frame via
-    :py:meth:`update_face_result` before ``apply`` is called.
+    All visual properties (dot colour, dot size, arrow colours) are
+    fixed constants.  The filter has no user-adjustable parameters
+    (REQ-LM-002).
 
-    Parameters
-    ----------
-    ``dot_radius`` : float [1.0 – 20.0]
-        Dot radius in pixels.  Defaults to ``3.0``.
-    ``dot_r`` : float [0.0 – 1.0]
-        Red channel of dot colour.  Defaults to ``0.0``.
-    ``dot_g`` : float [0.0 – 1.0]
-        Green channel of dot colour.  Defaults to ``1.0`` (bright green).
-    ``dot_b`` : float [0.0 – 1.0]
-        Blue channel of dot colour.  Defaults to ``0.0``.
-    ``dot_a`` : float [0.0 – 1.0]
-        Dot opacity.  Defaults to ``1.0`` (fully opaque).
+    Face tracking data is supplied each frame via
+    :py:meth:`update_face_result` before :py:meth:`apply` is called.
     """
 
     def __init__(self) -> None:
-        """Initialise the face landmark filter with default parameters."""
+        """Initialise the filter.  All visual constants are hard-coded."""
         super().__init__()
-        # Runtime-adjustable parameters exposed to the widget panel.
-        # Default: bright green, 3-pixel radius.
-        self.params: Dict[str, Any] = {
-            "dot_radius": 3.0,
-            "dot_r":      0.0,
-            "dot_g":      1.0,
-            "dot_b":      0.0,
-            "dot_a":      1.0,
-        }
 
-        # Latest face tracking result; updated each frame via
-        # update_face_result() before apply() is called.
+        # Latest face tracking result; injected each frame before apply().
         self._face_result: Optional[FaceTrackResult] = None
 
-        # GPU resources — created in _build_pipeline, released in teardown.
+        # GPU pipeline resources — created in _build_pipeline.
         self._blit_pipeline: Any = None
         self._blit_bgl: Any = None
         self._landmark_pipeline: Any = None
         self._landmark_bgl: Any = None
         self._landmark_param_buffer: Any = None
         self._landmark_vertex_buffer: Any = None
+
+        # Overlay (arrows + badge) pipeline resources
+        self._overlay_pipeline: Any = None
+        self._overlay_bgl: Any = None
+        # Overlay texture is lazy-initialised on the first apply() call
+        # because texture dimensions are only known then.
+        self._overlay_texture: Any = None
 
     # ------------------------------------------------------------------
     # Identity
@@ -217,9 +234,9 @@ class FaceLandmarkFilter(BaseFilter):
         Store the latest face tracking result for use in the next frame.
 
         Called by the rendering pipeline each frame before
-        :py:meth:`apply`.  Passing ``None`` or a result whose
-        ``face_detected`` flag is ``False`` causes only the blit pass
-        to run in ``apply``, leaving the frame unmodified.
+        :py:meth:`apply`.  When ``result`` is ``None`` or
+        ``face_detected`` is ``False``, the landmark and arrow passes
+        are skipped and the badge shows a red cross.
 
         Parameters:
             result (Optional[FaceTrackResult]): Latest face tracking
@@ -237,14 +254,18 @@ class FaceLandmarkFilter(BaseFilter):
         texture_format: wgpu.TextureFormat,
     ) -> None:
         """
-        Compile both WGSL shaders and pre-allocate all GPU resources.
+        Compile all WGSL shaders and pre-allocate fixed GPU resources.
 
         Creates:
-        * Blit render pipeline (full-screen triangle, no blending).
-        * Landmark render pipeline (instanced quads, alpha blending).
-        * Uniform buffer for ``LandmarkParams`` (32 bytes).
-        * Vertex buffer pre-allocated for ``MAX_LANDMARKS`` NDC
-          positions (``MAX_LANDMARKS × 8`` bytes).
+        * Blit render pipeline (pass-through, no blending).
+        * Landmark render pipeline (instanced SDF circles, alpha blend).
+        * Uniform buffer for LandmarkParams (32 bytes).
+        * Vertex buffer for MAX_LANDMARKS NDC positions (478 × 8 bytes).
+        * Overlay render pipeline (alpha-blended full-screen blit).
+
+        The overlay texture is not allocated here because texture
+        dimensions are not yet available; it is lazy-initialised on the
+        first :py:meth:`apply` call.
 
         Parameters:
             device (wgpu.GPUDevice): The active WebGPU device.
@@ -252,6 +273,81 @@ class FaceLandmarkFilter(BaseFilter):
         """
         self._build_blit_pipeline(device, texture_format)
         self._build_landmark_pipeline(device, texture_format)
+        self._build_overlay_pipeline(device, texture_format)
+
+    def _build_overlay_pipeline(
+        self,
+        device: wgpu.GPUDevice,
+        texture_format: wgpu.TextureFormat,
+    ) -> None:
+        """
+        Build the alpha-blended overlay blit pipeline.
+
+        Reuses the blit WGSL but enables alpha blending so the
+        CPU-drawn overlay (arrows and badge) composites correctly onto
+        the output texture.
+
+        Parameters:
+            device (wgpu.GPUDevice): The active WebGPU device.
+            texture_format (wgpu.TextureFormat): Target texture format.
+        """
+        shader = device.create_shader_module(code=_WGSL_BLIT)
+
+        bgl = device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {
+                        "sample_type": "float",
+                        "view_dimension": "2d",
+                        "multisampled": False,
+                    },
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+            ]
+        )
+        self._overlay_bgl = bgl
+
+        # Alpha blending: src*src_alpha + dst*(1-src_alpha)
+        blend_state = {
+            "color": {
+                "src_factor": "src-alpha",
+                "dst_factor": "one-minus-src-alpha",
+                "operation": "add",
+            },
+            "alpha": {
+                "src_factor": "one",
+                "dst_factor": "one-minus-src-alpha",
+                "operation": "add",
+            },
+        }
+
+        layout = device.create_pipeline_layout(
+            bind_group_layouts=[bgl]
+        )
+        self._overlay_pipeline = device.create_render_pipeline(
+            layout=layout,
+            vertex={
+                "module": shader,
+                "entry_point": "vs_blit",
+                "buffers": [],
+            },
+            fragment={
+                "module": shader,
+                "entry_point": "fs_blit",
+                "targets": [
+                    {"format": texture_format, "blend": blend_state}
+                ],
+            },
+            primitive={"topology": "triangle-list"},
+            depth_stencil=None,
+            multisample=None,
+        )
 
     def _build_blit_pipeline(
         self,
@@ -365,7 +461,7 @@ class FaceLandmarkFilter(BaseFilter):
             },
             "alpha": {
                 "src_factor": "one",
-                "dst_factor": "zero",
+                "dst_factor": "one-minus-src-alpha",
                 "operation": "add",
             },
         }
@@ -410,6 +506,9 @@ class FaceLandmarkFilter(BaseFilter):
         self._landmark_bgl = None
         self._landmark_param_buffer = None
         self._landmark_vertex_buffer = None
+        self._overlay_pipeline = None
+        self._overlay_bgl = None
+        self._overlay_texture = None
         super().teardown()
 
     # ------------------------------------------------------------------
@@ -425,17 +524,13 @@ class FaceLandmarkFilter(BaseFilter):
         """
         Record GPU commands for one frame.
 
-        Executes two render passes:
+        Executes up to three render passes:
 
-        1. Blit pass: copies ``input_texture`` to ``output_texture``
-           using a full-screen triangle.
-        2. Landmark overlay pass (only when a face is detected): draws
-           instanced circular dots at each landmark position with alpha
-           blending, loading and preserving the blit result.
-
-        Landmark NDC positions are uploaded to the pre-allocated vertex
-        buffer before drawing.  Dot colour and NDC radius are uploaded
-        to the uniform buffer.
+        1. **Blit pass**: copies ``input_texture`` to ``output_texture``.
+        2. **Landmark pass** (face detected only): 478 instanced white
+           SDF circles, alpha-blended over the output.
+        3. **Overlay pass** (always): CPU-drawn arrows and badge
+           composited over the output.
 
         Parameters:
             encoder (wgpu.GPUCommandEncoder): Current frame command
@@ -446,32 +541,38 @@ class FaceLandmarkFilter(BaseFilter):
         device = self._device
         assert device is not None, "apply() called before setup()"
 
-        # --- Pass 1: Blit input → output ----------------------------
+        w, h = input_texture.size[0], input_texture.size[1]
+
+        # Pass 1: blit input → output
         self._record_blit_pass(encoder, input_texture, output_texture)
 
-        # --- Pass 2: Landmark overlay (only if face detected) --------
-        if not self._has_visible_landmarks():
-            return
+        # Pass 2: landmark dots (only when a face is present)
+        if self._has_visible_landmarks():
+            landmarks = (
+                self._face_result.landmarks  # type: ignore[union-attr]
+            )
+            num = len(landmarks)
+            self._upload_landmark_positions(device, landmarks)
+            self._upload_landmark_params(device, input_texture)
+            self._record_landmark_pass(
+                encoder, output_texture, device, num
+            )
 
-        landmarks = self._face_result.landmarks  # type: ignore[union-attr]
-        num_landmarks = len(landmarks)
-
-        self._upload_landmark_positions(device, landmarks)
-        self._upload_landmark_params(device, input_texture, num_landmarks)
-        self._record_landmark_pass(
-            encoder, output_texture, device, num_landmarks
-        )
+        # Pass 3: overlay (arrows + badge — badge always visible)
+        self._ensure_overlay_texture(device, w, h)
+        self._update_overlay_texture(device, w, h)
+        self._record_overlay_pass(encoder, output_texture, device)
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Private helpers — render passes
     # ------------------------------------------------------------------
 
     def _has_visible_landmarks(self) -> bool:
         """
-        Return True when the stored face result contains visible landmarks.
+        Return True when the stored result contains visible landmarks.
 
         Returns:
-            bool: True if landmarks should be drawn this frame.
+            bool: True if landmark dots should be drawn this frame.
         """
         return (
             self._face_result is not None
@@ -486,7 +587,8 @@ class FaceLandmarkFilter(BaseFilter):
         output_texture: wgpu.GPUTexture,
     ) -> None:
         """
-        Record a full-screen blit from input_texture to output_texture.
+        Record a full-screen blit from ``input_texture`` to
+        ``output_texture``.
 
         Parameters:
             encoder (wgpu.GPUCommandEncoder): Current command encoder.
@@ -497,7 +599,10 @@ class FaceLandmarkFilter(BaseFilter):
         bind_group = device.create_bind_group(
             layout=self._blit_bgl,
             entries=[
-                {"binding": 0, "resource": input_texture.create_view()},
+                {
+                    "binding": 0,
+                    "resource": input_texture.create_view(),
+                },
                 {"binding": 1, "resource": self._sampler},
             ],
         )
@@ -513,7 +618,7 @@ class FaceLandmarkFilter(BaseFilter):
         )
         pass_enc.set_pipeline(self._blit_pipeline)
         pass_enc.set_bind_group(0, bind_group, [], 0, 0)
-        pass_enc.draw(3, 1, 0, 0)  # Full-screen triangle
+        pass_enc.draw(3, 1, 0, 0)  # full-screen triangle
         pass_enc.end()
 
     def _upload_landmark_positions(
@@ -524,12 +629,11 @@ class FaceLandmarkFilter(BaseFilter):
         """
         Convert landmarks to NDC and upload to the vertex buffer.
 
-        Coordinate conversion (GUD-LM-003):
+        Coordinate conversion (section 6.4 of spec):
             ndc_x = landmark.x * 2 - 1
             ndc_y = 1 - landmark.y * 2   (flip Y axis)
 
-        Only landmarks within the pre-allocated buffer capacity
-        (``MAX_LANDMARKS``) are written.
+        Only the first ``MAX_LANDMARKS`` entries are written.
 
         Parameters:
             device (wgpu.GPUDevice): The active WebGPU device.
@@ -538,50 +642,45 @@ class FaceLandmarkFilter(BaseFilter):
         count = min(len(landmarks), MAX_LANDMARKS)
         positions: list[float] = []
         for lm in landmarks[:count]:
-            positions.append(lm.x * 2.0 - 1.0)       # ndc_x
-            positions.append(1.0 - lm.y * 2.0)        # ndc_y (flip)
+            positions.append(lm.x * 2.0 - 1.0)   # ndc_x
+            positions.append(1.0 - lm.y * 2.0)    # ndc_y (flip)
 
         data = struct.pack(f"{count * 2}f", *positions)
-        device.queue.write_buffer(self._landmark_vertex_buffer, 0, data)
+        device.queue.write_buffer(
+            self._landmark_vertex_buffer, 0, data
+        )
 
     def _upload_landmark_params(
         self,
         device: wgpu.GPUDevice,
         input_texture: wgpu.GPUTexture,
-        num_landmarks: int,
     ) -> None:
         """
-        Build and upload the LandmarkParams uniform buffer.
+        Upload the LandmarkParams uniform buffer using fixed white values.
 
-        NDC radius is computed from the input texture dimensions to
-        produce aspect-ratio-correct circular dots (GUD-LM-004):
-            radius_x = 2 * dot_radius / texture_width
-            radius_y = 2 * dot_radius / texture_height
+        NDC radius is aspect-ratio corrected from the texture dimensions:
+            radius_x = 2 * DOT_RADIUS_PX / texture_width
+            radius_y = 2 * DOT_RADIUS_PX / texture_height
 
         Parameters:
             device (wgpu.GPUDevice): The active WebGPU device.
-            input_texture (wgpu.GPUTexture): Used to obtain frame
-                dimensions for aspect-ratio correction.
-            num_landmarks (int): Number of landmarks to render (unused
-                here but kept for call-site symmetry).
+            input_texture (wgpu.GPUTexture): Provides frame dimensions.
         """
         tex_w, tex_h = input_texture.size[0], input_texture.size[1]
-        px_radius = float(self.params["dot_radius"])
-        radius_x = 2.0 * px_radius / tex_w
-        radius_y = 2.0 * px_radius / tex_h
+        radius_x = 2.0 * _DOT_RADIUS_PX / tex_w
+        radius_y = 2.0 * _DOT_RADIUS_PX / tex_h
 
         data = struct.pack(
             "ffffffff",
-            float(self.params["dot_r"]),
-            float(self.params["dot_g"]),
-            float(self.params["dot_b"]),
-            float(self.params["dot_a"]),
+            1.0, 1.0, 1.0, 1.0,   # white (dot_r, dot_g, dot_b, dot_a)
             radius_x,
             radius_y,
             0.0,   # _pad0
             0.0,   # _pad1
         )
-        device.queue.write_buffer(self._landmark_param_buffer, 0, data)
+        device.queue.write_buffer(
+            self._landmark_param_buffer, 0, data
+        )
 
     def _record_landmark_pass(
         self,
@@ -594,12 +693,11 @@ class FaceLandmarkFilter(BaseFilter):
         Record the instanced landmark circle draw pass.
 
         Uses ``load_op="load"`` to preserve the blit result and
-        composites the dots with alpha blending.
+        composites dots with alpha blending.
 
         Parameters:
             encoder (wgpu.GPUCommandEncoder): Current command encoder.
-            output_texture (wgpu.GPUTexture): Render target (preserving
-                blit output underneath the dots).
+            output_texture (wgpu.GPUTexture): Render target.
             device (wgpu.GPUDevice): The active WebGPU device.
             num_landmarks (int): Number of instances to draw.
         """
@@ -627,9 +725,231 @@ class FaceLandmarkFilter(BaseFilter):
         )
         pass_enc.set_pipeline(self._landmark_pipeline)
         pass_enc.set_bind_group(0, bind_group, [], 0, 0)
-        pass_enc.set_vertex_buffer(
-            0, self._landmark_vertex_buffer
-        )
-        # 6 vertices per quad, one instance per landmark
+        pass_enc.set_vertex_buffer(0, self._landmark_vertex_buffer)
+        # 6 vertices per quad (2 triangles), one instance per landmark
         pass_enc.draw(6, num_landmarks, 0, 0)
+        pass_enc.end()
+
+    # ------------------------------------------------------------------
+    # Private helpers — overlay (arrows + badge)
+    # ------------------------------------------------------------------
+
+    def _ensure_overlay_texture(
+        self,
+        device: wgpu.GPUDevice,
+        width: int,
+        height: int,
+    ) -> None:
+        """
+        Lazy-initialise the overlay RGBA texture on the first apply call.
+
+        Not allocated in ``_build_pipeline`` because texture dimensions
+        are not available at that stage.  After the first call the
+        texture is reused every frame without reallocation.
+
+        Parameters:
+            device (wgpu.GPUDevice): The active WebGPU device.
+            width (int): Frame width in pixels.
+            height (int): Frame height in pixels.
+        """
+        if self._overlay_texture is not None:
+            return
+        self._overlay_texture = device.create_texture(
+            size=(width, height, 1),
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=(
+                wgpu.TextureUsage.TEXTURE_BINDING
+                | wgpu.TextureUsage.COPY_DST
+            ),
+        )
+
+    def _draw_overlay(
+        self,
+        face_result: Optional[FaceTrackResult],
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        """
+        Draw arrows and the face-detected badge into an RGBA numpy array.
+
+        The canvas is transparent everywhere except for the drawn
+        elements.  Arrows are omitted when no face is detected; the
+        badge is always present.
+
+        Arrow layout (all from ``_ARROW_ORIGIN`` at the top-left corner):
+
+        * **Blue** (yaw)   — horizontal; positive yaw → right.
+        * **Green** (pitch) — vertical; positive pitch → downward.
+        * **Red** (roll)   — direction of the face's ``up`` axis after
+          rotation; positive roll tilts clockwise → arrow tilts right.
+
+        Badge layout (top-right corner):
+
+        * Green circle + white ✓ when a face is detected.
+        * Red circle + white ✗ when no face is detected.
+
+        Parameters:
+            face_result (Optional[FaceTrackResult]): Latest tracking
+                result, or ``None`` if tracking has not run.
+            width (int): Frame width in pixels.
+            height (int): Frame height in pixels.
+
+        Returns:
+            np.ndarray: RGBA uint8 array of shape
+            ``(height, width, 4)``.
+        """
+        face_detected = (
+            face_result is not None and face_result.face_detected
+        )
+
+        # Transparent BGRA canvas; cv2 uses BGRA channel order.
+        canvas = np.zeros((height, width, 4), dtype=np.uint8)
+
+        # -- Arrows (only when face detected) -------------------------
+        if face_detected and face_result is not None:
+            hp = face_result.head_pose
+            ox, oy = _ARROW_ORIGIN
+
+            # Clamp each angle to keep arrows within the frame.
+            yaw = max(
+                -_ARROW_MAX_ANGLE, min(_ARROW_MAX_ANGLE, hp.yaw)
+            )
+            pitch = max(
+                -_ARROW_MAX_ANGLE, min(_ARROW_MAX_ANGLE, hp.pitch)
+            )
+            roll = max(
+                -_ARROW_MAX_ANGLE, min(_ARROW_MAX_ANGLE, hp.roll)
+            )
+
+            # Yaw — horizontal (positive yaw → rightward arrow)
+            yaw_end_x = ox + int(
+                yaw / _ARROW_MAX_ANGLE * _ARROW_MAX_LEN_PX
+            )
+            if yaw_end_x != ox:
+                cv2.arrowedLine(
+                    canvas, (ox, oy), (yaw_end_x, oy),
+                    _YAW_BGRA, _ARROW_THICKNESS, tipLength=0.3,
+                )
+
+            # Pitch — vertical (positive pitch → downward arrow)
+            pitch_end_y = oy + int(
+                pitch / _ARROW_MAX_ANGLE * _ARROW_MAX_LEN_PX
+            )
+            if pitch_end_y != oy:
+                cv2.arrowedLine(
+                    canvas, (ox, oy), (ox, pitch_end_y),
+                    _PITCH_BGRA, _ARROW_THICKNESS, tipLength=0.3,
+                )
+
+            # Roll — shows direction the top-of-head faces.
+            # At roll=0 the arrow points straight up (-y in screen
+            # coordinates).  Positive roll tilts it clockwise.
+            roll_rad = math.radians(roll)
+            roll_len = int(
+                abs(roll) / _ARROW_MAX_ANGLE * _ARROW_MAX_LEN_PX
+            )
+            if roll_len > 0:
+                roll_dx = int(math.sin(roll_rad) * roll_len)
+                # Negative because screen y increases downward.
+                roll_dy = int(-math.cos(roll_rad) * roll_len)
+                cv2.arrowedLine(
+                    canvas, (ox, oy),
+                    (ox + roll_dx, oy + roll_dy),
+                    _ROLL_BGRA, _ARROW_THICKNESS, tipLength=0.3,
+                )
+
+        # -- Badge (always visible) -----------------------------------
+        bx = width - _BADGE_MARGIN_PX
+        by = _BADGE_MARGIN_PX
+        badge_colour = (
+            _GREEN_BADGE_BGRA if face_detected else _RED_BADGE_BGRA
+        )
+        cv2.circle(canvas, (bx, by), _BADGE_RADIUS_PX, badge_colour, -1)
+
+        if face_detected:
+            # Check mark ✓: two line segments
+            cv2.line(canvas, (bx - 7, by), (bx - 2, by + 6),
+                     _WHITE_BGRA, 2)
+            cv2.line(canvas, (bx - 2, by + 6), (bx + 8, by - 8),
+                     _WHITE_BGRA, 2)
+        else:
+            # Cross ✗: two diagonal lines
+            cv2.line(canvas, (bx - 7, by - 7), (bx + 7, by + 7),
+                     _WHITE_BGRA, 2)
+            cv2.line(canvas, (bx + 7, by - 7), (bx - 7, by + 7),
+                     _WHITE_BGRA, 2)
+
+        # Convert BGRA → RGBA for GPU upload.
+        return cv2.cvtColor(canvas, cv2.COLOR_BGRA2RGBA)
+
+    def _update_overlay_texture(
+        self,
+        device: wgpu.GPUDevice,
+        width: int,
+        height: int,
+    ) -> None:
+        """
+        Draw the current frame's overlay and upload it to the GPU.
+
+        Parameters:
+            device (wgpu.GPUDevice): The active WebGPU device.
+            width (int): Frame width in pixels.
+            height (int): Frame height in pixels.
+        """
+        rgba = self._draw_overlay(self._face_result, width, height)
+        rgba_c = np.ascontiguousarray(rgba)
+        device.queue.write_texture(
+            {
+                "texture": self._overlay_texture,
+                "mip_level": 0,
+                "origin": (0, 0, 0),
+            },
+            rgba_c.tobytes(),
+            {
+                "offset": 0,
+                "bytes_per_row": width * 4,
+                "rows_per_image": height,
+            },
+            (width, height, 1),
+        )
+
+    def _record_overlay_pass(
+        self,
+        encoder: wgpu.GPUCommandEncoder,
+        output_texture: wgpu.GPUTexture,
+        device: wgpu.GPUDevice,
+    ) -> None:
+        """
+        Record the alpha-blended overlay blit onto ``output_texture``.
+
+        Uses ``load_op="load"`` so the existing output content (blit +
+        optional landmark dots) is preserved underneath the overlay.
+
+        Parameters:
+            encoder (wgpu.GPUCommandEncoder): Current command encoder.
+            output_texture (wgpu.GPUTexture): Render target.
+            device (wgpu.GPUDevice): The active WebGPU device.
+        """
+        bind_group = device.create_bind_group(
+            layout=self._overlay_bgl,
+            entries=[
+                {
+                    "binding": 0,
+                    "resource": self._overlay_texture.create_view(),
+                },
+                {"binding": 1, "resource": self._sampler},
+            ],
+        )
+        pass_enc = encoder.begin_render_pass(
+            color_attachments=[
+                {
+                    "view": output_texture.create_view(),
+                    "load_op": "load",   # preserve blit + dots
+                    "store_op": "store",
+                }
+            ]
+        )
+        pass_enc.set_pipeline(self._overlay_pipeline)
+        pass_enc.set_bind_group(0, bind_group, [], 0, 0)
+        pass_enc.draw(3, 1, 0, 0)  # full-screen triangle
         pass_enc.end()
