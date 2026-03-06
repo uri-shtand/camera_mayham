@@ -13,11 +13,14 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 
+# Runtime import — TrackerConfig is used as a default_factory value.
+from tracking.face_tracker import TrackerConfig
+
 if TYPE_CHECKING:
     from filters.base import BaseFilter
     from games.base import BaseGame
     from overlays.base import BaseOverlay
-    from tracking.face_tracker import FaceTrackResult
+    from tracking.face_tracker import FrameTrackResult
 
 
 @dataclass
@@ -51,8 +54,13 @@ class AppState:
     # ------------------------------------------------------------------
     # Face tracking — result of the most recent MediaPipe inference pass
     # ------------------------------------------------------------------
-    face_result: Optional[FaceTrackResult] = None
-    """Latest face tracking result, or None when no face is detected."""
+    face_result: Optional[FrameTrackResult] = None
+    """Latest frame tracking result (all detected faces), or None before
+    the first frame is processed."""
+
+    tracker_config: TrackerConfig = field(default_factory=TrackerConfig)
+    """Current face tracker configuration; kept in sync with FaceTracker
+    by the Application layer so the UI always reads up-to-date settings."""
 
     # ------------------------------------------------------------------
     # Filter chain — ordered list of active GPU shader filters (REQ-002)

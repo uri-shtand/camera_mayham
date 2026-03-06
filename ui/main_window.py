@@ -53,6 +53,7 @@ from typing import (
 
 import dearpygui.dearpygui as dpg
 import numpy as np
+from tracking.face_tracker import TrackerConfig, TrackerMode
 
 if TYPE_CHECKING:
     from app.state import AppState
@@ -85,6 +86,7 @@ _TAG_BAR_WIN: str = "mw_bar"
 _TAG_TRAY_WIN: str = "mw_tray"
 _TAG_FPS_TEXT: str = "mw_fps"
 _TAG_FRAME_MS_TEXT: str = "mw_frame_ms"
+_TAG_TRACKER_STATUS: str = "mw_tracker_status"
 
 # ---------------------------------------------------------------------------
 # Colour tokens for active / inactive widget states
@@ -233,7 +235,48 @@ class MainWindow:
         self._theme_active: int = 0
         self._theme_inactive: int = 0
 
+        # Face tracker settings widget
+        self._tracker_config: Optional[TrackerConfig] = None
+        self._tracker_reconfigure_cb: Optional[Callable] = None
+        # Non-None when a mode change is pending; flushed in render_frame
+        # so the "Reinitialising…" label is visible for at least one tick.
+        self._pending_tracker_reinit: Optional[TrackerConfig] = None
+        self._tracker_item: Optional[WidgetItem] = None
+
         self._ready: bool = False
+
+    # ------------------------------------------------------------------
+    # Tracker widget registration
+    # ------------------------------------------------------------------
+
+    def set_tracker_widget(
+        self,
+        config: TrackerConfig,
+        on_change: Callable[[TrackerConfig], None],
+    ) -> None:
+        """
+        Register the face tracker settings widget.
+
+        Must be called before :py:meth:`setup` so the widget is included
+        when the bar is built.  The widget exposes operating mode,
+        sensitivity, and number of faces (spec §4).
+
+        Parameters:
+            config (TrackerConfig): Initial tracker configuration to
+                display in the widget tray.
+            on_change (Callable[[TrackerConfig], None]): Callback invoked
+                whenever the user changes a setting.  Receives the full
+                updated config.
+        """
+        self._tracker_config = config
+        self._tracker_reconfigure_cb = on_change
+        self._tracker_item = WidgetItem(
+            id="tracker_settings",
+            label="Tracking",
+            icon="◎",
+            category="tracker",
+            is_expandable=True,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -321,6 +364,16 @@ class MainWindow:
         # Refresh expansion tray game status if a game tray is open.
         if self._expanded_id is not None:
             self._refresh_tray_status()
+
+        # Flush any pending tracker mode-change reinit.  This runs after
+        # DPG has rendered the "Reinitialising…" status text at least once.
+        if self._pending_tracker_reinit is not None:
+            cfg = self._pending_tracker_reinit
+            self._pending_tracker_reinit = None
+            if self._tracker_reconfigure_cb is not None:
+                self._tracker_reconfigure_cb(cfg)
+            if dpg.does_item_exist(_TAG_TRACKER_STATUS):
+                dpg.set_value(_TAG_TRACKER_STATUS, "")
 
         dpg.render_dearpygui_frame()
 
@@ -501,6 +554,11 @@ class MainWindow:
                 if self._game_items:
                     for item in self._game_items:
                         self._build_widget_item(item)
+                    self._build_group_separator()
+
+                # ── Tracker settings widget ───────────────────────────
+                if self._tracker_item is not None:
+                    self._build_widget_item(self._tracker_item)
                     self._build_group_separator()
 
                 # ── Diagnostics (right-flush) ─────────────────────────
@@ -742,6 +800,12 @@ class MainWindow:
                 self._state.launch_game(game)
                 logger.info("Game '%s' launched.", cfg.item.label)
 
+        elif item.category == "tracker":
+            # Tracker widget has no on/off state; icon click toggles the
+            # settings tray just like the expand-chevron does.
+            self._on_expand(item)
+            return  # skip _refresh_item_visuals
+
         self._refresh_item_visuals()
 
     def _on_expand(self, item: WidgetItem) -> None:
@@ -798,6 +862,8 @@ class MainWindow:
             self._build_filter_tray(item)
         elif item.category == "game":
             self._build_game_tray(item)
+        elif item.category == "tracker":
+            self._build_tracker_tray(item)
 
     def _build_filter_tray(self, item: WidgetItem) -> None:
         """
@@ -869,6 +935,163 @@ class MainWindow:
             tag="tray_game_status",
             parent=_TAG_TRAY_WIN,
         )
+
+    def _build_tracker_tray(self, item: WidgetItem) -> None:
+        """
+        Populate the tray with face tracker configuration controls
+        (spec §4 Configurable parameters).
+
+        Three controls are provided:
+        * **Mode** combo — ``video`` / ``image``; mode changes schedule a
+          reinit so the loading label is shown for at least one frame.
+        * **Sensitivity** float slider [0.0, 1.0] — applied immediately.
+        * **Num Faces** int slider [1, 4] — applied immediately.
+
+        Parameters:
+            item (WidgetItem): The tracker widget item being expanded.
+        """
+        if self._tracker_config is None:
+            return
+
+        dpg.add_text(
+            "Face Tracking — Settings",
+            parent=_TAG_TRAY_WIN,
+            color=(200, 200, 100, 255),
+        )
+        dpg.add_separator(parent=_TAG_TRAY_WIN)
+
+        # Operating mode selector
+        dpg.add_combo(
+            label="Mode",
+            items=[TrackerMode.VIDEO.value, TrackerMode.IMAGE.value],
+            default_value=self._tracker_config.mode.value,
+            callback=self._make_tracker_mode_cb(),
+            parent=_TAG_TRAY_WIN,
+            width=120,
+        )
+
+        # Sensitivity slider (takes effect immediately)
+        dpg.add_slider_float(
+            label="Sensitivity",
+            default_value=self._tracker_config.sensitivity,
+            min_value=0.0,
+            max_value=1.0,
+            callback=self._make_tracker_sensitivity_cb(),
+            parent=_TAG_TRAY_WIN,
+            width=self._cam_w - 160,
+        )
+
+        # Number of faces slider (takes effect immediately)
+        dpg.add_slider_int(
+            label="Num Faces",
+            default_value=self._tracker_config.num_faces,
+            min_value=1,
+            max_value=4,
+            callback=self._make_tracker_num_faces_cb(),
+            parent=_TAG_TRAY_WIN,
+            width=self._cam_w - 160,
+        )
+
+        # Status text shown briefly while reinitialising after a mode change
+        dpg.add_text(
+            "",
+            tag=_TAG_TRACKER_STATUS,
+            parent=_TAG_TRAY_WIN,
+            color=(255, 200, 80, 255),
+        )
+
+    # ------------------------------------------------------------------
+    # Tracker callbacks
+    # ------------------------------------------------------------------
+
+    def _make_tracker_mode_cb(self) -> Callable:
+        """
+        Return a DPG callback that schedules an operating-mode change.
+
+        Mode changes require a full landmarker reinit; the reinit is
+        deferred to the next :py:meth:`render_frame` tick so the
+        ``_TAG_TRACKER_STATUS`` label renders at least once before the
+        blocking call.
+
+        Returns:
+            Callable: DPG-compatible callback.
+        """
+        def cb(
+            sender: int, app_data: str, user_data: object
+        ) -> None:
+            if self._tracker_config is None:
+                return
+            try:
+                new_mode = TrackerMode(app_data)
+            except ValueError:
+                return
+            if new_mode == self._tracker_config.mode:
+                return
+            new_config = TrackerConfig(
+                mode=new_mode,
+                sensitivity=self._tracker_config.sensitivity,
+                num_faces=self._tracker_config.num_faces,
+            )
+            self._tracker_config = new_config
+            self._pending_tracker_reinit = new_config
+            if dpg.does_item_exist(_TAG_TRACKER_STATUS):
+                dpg.set_value(_TAG_TRACKER_STATUS, "Reinitialising…")
+        return cb
+
+    def _make_tracker_sensitivity_cb(self) -> Callable:
+        """
+        Return a DPG callback that immediately applies a sensitivity change.
+
+        Sensitivity changes do not alter the running mode so the tracker
+        is reconfigured straight away without a deferred flush step.
+
+        Returns:
+            Callable: DPG-compatible callback.
+        """
+        def cb(
+            sender: int, app_data: float, user_data: object
+        ) -> None:
+            if (
+                self._tracker_config is None
+                or self._tracker_reconfigure_cb is None
+            ):
+                return
+            new_config = TrackerConfig(
+                mode=self._tracker_config.mode,
+                sensitivity=app_data,
+                num_faces=self._tracker_config.num_faces,
+            )
+            self._tracker_config = new_config
+            self._tracker_reconfigure_cb(new_config)
+        return cb
+
+    def _make_tracker_num_faces_cb(self) -> Callable:
+        """
+        Return a DPG callback that immediately applies a num-faces change.
+
+        Like sensitivity, changing the number of faces does not require
+        the loading-state feedback, so the tracker is reconfigured
+        straight away.
+
+        Returns:
+            Callable: DPG-compatible callback.
+        """
+        def cb(
+            sender: int, app_data: int, user_data: object
+        ) -> None:
+            if (
+                self._tracker_config is None
+                or self._tracker_reconfigure_cb is None
+            ):
+                return
+            new_config = TrackerConfig(
+                mode=self._tracker_config.mode,
+                sensitivity=self._tracker_config.sensitivity,
+                num_faces=app_data,
+            )
+            self._tracker_config = new_config
+            self._tracker_reconfigure_cb(new_config)
+        return cb
 
     # ------------------------------------------------------------------
     # Per-frame update helpers

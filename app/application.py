@@ -42,7 +42,7 @@ from filters.face_landmarks import FaceLandmarkFilter
 from filters.grayscale import GrayscaleFilter
 from games.bubble_pop import BubblePopGame
 from rendering.pipeline import RenderPipeline
-from tracking.face_tracker import FaceTracker
+from tracking.face_tracker import FaceTracker, TrackerConfig
 from ui.main_window import GameConfig, MainWindow, WidgetItem
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,8 @@ class Application:
             width=width,
             height=height,
         )
-        self._tracker = FaceTracker(num_faces=1)
+        # Config is loaded from disk automatically inside FaceTracker.__init__.
+        self._tracker = FaceTracker()
         # Offscreen pipeline — canvas=None (single-window mode)
         self._pipeline: RenderPipeline | None = None
         self._window: MainWindow | None = None
@@ -140,6 +141,8 @@ class Application:
 
         # -- Face tracker ---------------------------------------------
         self._tracker.setup()
+        # Sync saved config into shared state so the UI can read it.
+        self._state.tracker_config = self._tracker.config
 
         # -- Built-in filters (REQ-002); all off by default -----------
         for flt in [
@@ -176,9 +179,34 @@ class Application:
             camera_height=self._state.camera_height,
             game_configs=game_configs,
         )
+        # Register the tracker settings widget before building the UI.
+        self._window.set_tracker_widget(
+            config=self._tracker.config,
+            on_change=self._on_tracker_config_changed,
+        )
         self._window.setup()
 
         logger.info("Setup complete.")
+
+    # ------------------------------------------------------------------
+    # Tracker reconfiguration callback
+    # ------------------------------------------------------------------
+
+    def _on_tracker_config_changed(
+        self, new_config: "TrackerConfig"
+    ) -> None:
+        """
+        Callback invoked by the UI when the user changes tracker settings.
+
+        Applies the new configuration to the tracker (which also persists
+        it to disk) and syncs AppState so the UI can always read the
+        current values.
+
+        Parameters:
+            new_config (TrackerConfig): The updated tracker configuration.
+        """
+        self._tracker.reconfigure(new_config)
+        self._state.tracker_config = new_config
 
     # ------------------------------------------------------------------
     # Main loop

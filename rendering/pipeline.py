@@ -299,12 +299,22 @@ class RenderPipeline:
             self._filter_pass.textures[1],
         )
 
+        # Extract the primary (highest-confidence) face for single-face
+        # consumers.  state.face_result is now a FrameTrackResult that may
+        # contain multiple faces; primary_face returns the first one (or a
+        # zeroed FaceTrackResult when no face is present).
+        primary = (
+            state.face_result.primary_face
+            if state.face_result is not None
+            else None
+        )
+
         # Inject face tracking data into face-aware filters (e.g.
         # FaceLandmarkFilter) before the filter chain records commands.
         # Duck-typing is used so BaseFilter's interface remains unchanged.
         for flt in state.enabled_filters():
             if hasattr(flt, "update_face_result"):
-                flt.update_face_result(state.face_result)
+                flt.update_face_result(primary)
 
         # Pass 2: filter chain — ping-pong tex[1] → filtered texture
         filtered_tex = self._filter_pass.record(
@@ -318,7 +328,7 @@ class RenderPipeline:
             encoder,
             filtered_tex,
             state.active_overlay,
-            state.face_result,
+            primary,
         )
 
         # Pass 4: game pass — composite game elements
@@ -326,7 +336,7 @@ class RenderPipeline:
             encoder,
             filtered_tex,
             state.active_game,
-            state.face_result,
+            primary,
             dt,
         )
 

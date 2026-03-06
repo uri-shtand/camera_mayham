@@ -5,6 +5,9 @@ Tests cover:
 * Data class defaults
 * FaceTracker._estimate_head_pose (pure maths, no MediaPipe required)
 * cv2_bgr_to_rgb colour channel swap
+* FrameTrackResult.primary_face backwards-compatibility property
+* TrackerConfig defaults, clamp behaviour, and JSON round-trip
+* TrackerMode enum values
 
 FaceTracker.process and FaceTracker.setup are integration tests
 requiring a real MediaPipe model; they are skipped unless MediaPipe is
@@ -22,10 +25,204 @@ import pytest
 from tracking.face_tracker import (
     FaceTrackResult,
     FaceTracker,
+    FrameTrackResult,
     HeadPose,
     Landmark,
+    TrackerConfig,
+    TrackerMode,
     cv2_bgr_to_rgb,
 )
+
+# ---------------------------------------------------------------------------
+# TrackerMode
+# ---------------------------------------------------------------------------
+
+
+class TestTrackerMode:
+    """Tests for the TrackerMode enum."""
+
+    def test_video_value(self):
+        """
+        Test that TrackerMode.VIDEO has the expected string value.
+
+        Expected: TrackerMode.VIDEO == "video".
+        """
+        assert TrackerMode.VIDEO == "video"
+
+    def test_image_value(self):
+        """
+        Test that TrackerMode.IMAGE has the expected string value.
+
+        Expected: TrackerMode.IMAGE == "image".
+        """
+        assert TrackerMode.IMAGE == "image"
+
+    def test_from_string_video(self):
+        """
+        Test that TrackerMode can be constructed from a plain string.
+
+        Expected: TrackerMode("video") == TrackerMode.VIDEO.
+        """
+        assert TrackerMode("video") is TrackerMode.VIDEO
+
+    def test_from_string_image(self):
+        """
+        Test that TrackerMode can be constructed from a plain string.
+
+        Expected: TrackerMode("image") == TrackerMode.IMAGE.
+        """
+        assert TrackerMode("image") is TrackerMode.IMAGE
+
+
+# ---------------------------------------------------------------------------
+# TrackerConfig
+# ---------------------------------------------------------------------------
+
+
+class TestTrackerConfig:
+    """Tests for TrackerConfig defaults and persistence helpers."""
+
+    def test_default_mode_is_video(self):
+        """
+        Test that the default operating mode is VIDEO.
+
+        Expected: TrackerConfig().mode == TrackerMode.VIDEO.
+        """
+        assert TrackerConfig().mode == TrackerMode.VIDEO
+
+    def test_default_sensitivity(self):
+        """
+        Test that the default sensitivity is 0.5.
+
+        Expected: TrackerConfig().sensitivity == 0.5.
+        """
+        assert TrackerConfig().sensitivity == pytest.approx(0.5)
+
+    def test_default_num_faces(self):
+        """
+        Test that the default number of faces is 1.
+
+        Expected: TrackerConfig().num_faces == 1.
+        """
+        assert TrackerConfig().num_faces == 1
+
+    def test_load_returns_defaults_on_missing_file(self, tmp_path, monkeypatch):
+        """
+        Test that TrackerConfig.load() returns defaults when the config
+        file does not exist.
+
+        Expected: returned config has default values.
+        """
+        import tracking.face_tracker as ft
+        monkeypatch.setattr(ft, "_CONFIG_PATH", tmp_path / "no_file.json")
+        cfg = ft.TrackerConfig.load()
+        assert cfg.mode == TrackerMode.VIDEO
+        assert cfg.sensitivity == pytest.approx(0.5)
+        assert cfg.num_faces == 1
+
+    def test_save_and_load_round_trip(self, tmp_path, monkeypatch):
+        """
+        Test that save() followed by load() restores the same values.
+
+        Expected: loaded config matches the saved config.
+        """
+        import tracking.face_tracker as ft
+        config_path = tmp_path / "tracker_config.json"
+        monkeypatch.setattr(ft, "_CONFIG_PATH", config_path)
+        original = TrackerConfig(
+            mode=TrackerMode.IMAGE, sensitivity=0.3, num_faces=2
+        )
+        original.save()
+        loaded = ft.TrackerConfig.load()
+        assert loaded.mode == TrackerMode.IMAGE
+        assert loaded.sensitivity == pytest.approx(0.3)
+        assert loaded.num_faces == 2
+
+    def test_load_clamps_sensitivity_above_one(self, tmp_path, monkeypatch):
+        """
+        Test that load() clamps sensitivity values above 1.0 to 1.0.
+
+        Expected: loaded sensitivity == 1.0 when stored value > 1.0.
+        """
+        import json
+        import tracking.face_tracker as ft
+        config_path = tmp_path / "tracker_config.json"
+        monkeypatch.setattr(ft, "_CONFIG_PATH", config_path)
+        config_path.write_text(json.dumps({"sensitivity": 5.0, "num_faces": 1}))
+        loaded = ft.TrackerConfig.load()
+        assert loaded.sensitivity == pytest.approx(1.0)
+
+    def test_load_clamps_num_faces_above_four(self, tmp_path, monkeypatch):
+        """
+        Test that load() clamps num_faces values above 4 to 4.
+
+        Expected: loaded num_faces == 4 when stored value > 4.
+        """
+        import json
+        import tracking.face_tracker as ft
+        config_path = tmp_path / "tracker_config.json"
+        monkeypatch.setattr(ft, "_CONFIG_PATH", config_path)
+        config_path.write_text(json.dumps({"num_faces": 99, "sensitivity": 0.5}))
+        loaded = ft.TrackerConfig.load()
+        assert loaded.num_faces == 4
+
+
+# ---------------------------------------------------------------------------
+# FrameTrackResult
+# ---------------------------------------------------------------------------
+
+
+class TestFrameTrackResult:
+    """Tests for the FrameTrackResult multi-face wrapper."""
+
+    def test_face_detected_defaults_false(self):
+        """
+        Test that face_detected is False when no arguments are given.
+
+        Expected: FrameTrackResult().face_detected == False.
+        """
+        assert FrameTrackResult().face_detected is False
+
+    def test_faces_default_empty(self):
+        """
+        Test that faces is an empty list by default.
+
+        Expected: FrameTrackResult().faces == [].
+        """
+        assert FrameTrackResult().faces == []
+
+    def test_primary_face_returns_default_when_no_faces(self):
+        """
+        Test that primary_face returns a zeroed FaceTrackResult when
+        no faces are present.
+
+        Expected: primary_face.face_detected == False and landmarks == [].
+        """
+        frame = FrameTrackResult()
+        primary = frame.primary_face
+        assert isinstance(primary, FaceTrackResult)
+        assert primary.face_detected is False
+        assert primary.landmarks == []
+
+    def test_primary_face_returns_first_face(self):
+        """
+        Test that primary_face returns faces[0] when faces are present.
+
+        Expected: primary_face is the same object as faces[0].
+        """
+        face_a = FaceTrackResult(face_detected=True)
+        face_b = FaceTrackResult(face_detected=True)
+        frame = FrameTrackResult(face_detected=True, faces=[face_a, face_b])
+        assert frame.primary_face is face_a
+
+    def test_primary_face_is_not_none(self):
+        """
+        Test that primary_face never returns None, even with no faces.
+
+        Expected: primary_face is always a FaceTrackResult instance.
+        """
+        assert FrameTrackResult().primary_face is not None
+
 
 # ---------------------------------------------------------------------------
 # Data class defaults
