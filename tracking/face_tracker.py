@@ -222,12 +222,18 @@ class FaceTrackResult:
         head_pose    : Estimated head orientation and rough translation.
         blendshapes  : Dict mapping blendshape name → coefficient [0, 1].
         face_detected: True for every result stored in FrameTrackResult.
+        face_matrix  : Optional 4 × 4 float32 row-major transformation
+                       matrix from MediaPipe
+                       ``facial_transformation_matrixes``; transforms
+                       canonical face model coordinates to camera space.
+                       ``None`` when unavailable (spec REQ-FG-006).
     """
 
     landmarks: List[Landmark] = field(default_factory=list)
     head_pose: HeadPose = field(default_factory=HeadPose)
     blendshapes: dict = field(default_factory=dict)
     face_detected: bool = False
+    face_matrix: Optional[np.ndarray] = None
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +545,17 @@ class FaceTracker:
                 bs.category_name: bs.score
                 for bs in detection.face_blendshapes[index]
             }
+
+        # Facial transformation matrix (REQ-FG-007):
+        # Guards against the field being absent (older MediaPipe builds
+        # or trackers configured without the flag) or out-of-bounds.
+        if (
+            hasattr(detection, "facial_transformation_matrixes")
+            and detection.facial_transformation_matrixes
+            and index < len(detection.facial_transformation_matrixes)
+        ):
+            raw_mat = detection.facial_transformation_matrixes[index]
+            result.face_matrix = np.array(raw_mat, dtype=np.float32)
 
         return result
 
