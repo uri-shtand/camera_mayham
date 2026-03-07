@@ -7,6 +7,7 @@ from filters.colour_shift import ColourShiftFilter  # noqa: F401
 from filters.face_landmarks import FaceLandmarkFilter  # noqa: F401
 from filters.moustache import MoustacheFilter  # noqa: F401
 from filters.face_geometry import FaceGeometryFilter  # noqa: F401
+from filters.manga import MangaFilter  # noqa: F401
 
 __all__ = [
     "BaseFilter",
@@ -16,5 +17,6 @@ __all__ = [
     "FaceLandmarkFilter",
     "MoustacheFilter",
     "FaceGeometryFilter",
+    "MangaFilter",
 ]
 

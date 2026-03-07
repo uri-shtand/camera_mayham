@@ -38,6 +38,7 @@ from app.state import AppState
 from camera.capture import CameraCapture
 from filters.colour_shift import ColourShiftFilter
 from filters.edge_detection import EdgeDetectionFilter
+from filters.manga import MangaFilter
 from filters.face_geometry import FaceGeometryFilter
 from filters.face_landmarks import FaceLandmarkFilter
 from filters.grayscale import GrayscaleFilter
@@ -154,6 +155,7 @@ class Application:
             FaceLandmarkFilter(),
             MoustacheFilter(),
             FaceGeometryFilter(),
+            MangaFilter(),
         ]:
             flt.enabled = False
             self._state.register_filter(flt)
